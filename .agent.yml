@@ -1,0 +1,102 @@
+# .agent.yml
+# AI-only operational manifest for the daneel framework.
+
+# ---------------------------------------------------------------------------
+# LANGUAGE
+# ---------------------------------------------------------------------------
+language:
+  chat: read from .daneel.yml     # language used when speaking with the user
+  files: english                  # all file content, commits, PR/issue bodies
+  filenames: english              # all file names AND folder names (snake_case, lowercase)
+
+# ---------------------------------------------------------------------------
+# WORK RULES
+# ---------------------------------------------------------------------------
+work_rules:
+  branch_per_issue: true
+  branch_naming: "{type}/{short-description}"
+  all_writes_via_pr: true
+  merge_strategy: squash
+  log_immutability: append-only — commit before responding
+  inbox_immutability: write-once — never edit after creation
+
+# ---------------------------------------------------------------------------
+# TOOL APPROVAL
+# false = execute immediately, no exceptions — irreversibility is not a reason to ask
+# true  = always ask before executing
+# ---------------------------------------------------------------------------
+tool_approval:
+  create_branch: false
+  push_files: false
+  create_pr: false
+  create_issue: false
+  create_sub_issue: false
+  update_issue: false
+  merge_to_main: false
+  delete_file: true
+  destructive_ops: true
+
+# ---------------------------------------------------------------------------
+# HARD RULES
+# Inherited from zeroth rules/agent.yml — never override.
+# ---------------------------------------------------------------------------
+hard_rules:
+  ref: Malstrom/zeroth:rules/agent.yml#hard_rules
+
+# ---------------------------------------------------------------------------
+# SCENARIOS
+# Read .scenarios.yml BEFORE any reasoning.
+# Every user message must be matched against scenarios first.
+# ---------------------------------------------------------------------------
+scenarios:
+  spec: Malstrom/zeroth:frameworks/daneel/.scenarios.yml
+  read_before_responding: true
+  on_no_match: propose new scenario to user before proceeding
+
+# ---------------------------------------------------------------------------
+# WORKSPACE
+# ---------------------------------------------------------------------------
+workspace:
+  .daneel.yml:
+    role: user profile, roles, domains, language, timezone
+    access: read-only
+  .scenarios.yml:
+    role: scenario catalog
+    access: read-only
+  .registry.yml:
+    role: cross-repo connections
+    access: read-only
+  contacts/:
+    role: external and internal contact profiles
+    access: read-write
+  playbooks/:
+    role: step-by-step instructions for recurring work types
+    access: read-write
+  templates/:
+    role: file templates for log, inbox, contact, playbook, client context
+    access: read-only
+  patterns:
+    - path: "clients/*/context.yml"
+      role: static client info
+      access: read-write
+    - path: "clients/*/summary.md"
+      role: human-facing client summary
+      access: read-write
+    - path: "clients/*/inbox/*.yml"
+      role: raw incoming tasks
+      access: write-once
+    - path: "clients/*/output/**"
+      role: AI-generated output for human delivery
+      access: read-write
+    - path: "clients/*/playbooks/**"
+      role: client-specific playbook overrides
+      access: read-write
+    - path: "clients/*/log/*.yml"
+      role: immutable daily work logs
+      access: append-only
+    - path: "clients/*/log/*.index.yml"
+      role: monthly log index, AI-generated
+      access: read-write
+    - path: "contacts/*.yml"
+      role: contact profiles
+      access: read-write
