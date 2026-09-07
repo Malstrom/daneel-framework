@@ -1,0 +1,84 @@
+# clients/chitai-gorod/playbooks/other_book_demand_reco_patch.yml
+# Schema: frameworks/daneel/templates/playbook_client.yml (#274)
+
+name: "Patching zero forecasts with an external recommendation service (Redis)"
+client: "chitai-gorod"
+contact: null
+work_type: "other"
+created: "2026-09-04"
+issue_ref: null
+usage_count: 1
+promoted_to_root: false
+
+context:
+  problem: >
+    The top-N and tail forecast pipelines leave most of the catalog at 0 for a
+    given shop - either the model saw the pair and predicted no sale, or the
+    pair never had enough history to be modelled at all. An existing external
+    recommendation service already ranks books per shop; the task is to use it
+    to fill some of those zeros in the two production forecast tables, then
+    extend that to also cover pairs the model never produced a row for at all,
+    without ever touching a forecast the model was confident about.
+  outcome: >
+    Two DAGs (book_demand_forecast_top_reco_60, book_demand_forecast_tail_reco_60),
+    each patching its own source forecast table and writing shop_id, book_id,
+    qty, source. First version only replaced existing zero rows (0-23% of zeros
+    depending on tier); a later extension also adds a new row (qty=1) for a
+    recommended pair that had no forecast row at all, which turned out to be
+    the majority case - 73.3% of the recommendation service's candidates
+    network-wide had no corresponding row in the tail forecast table before
+    this was added. Verified against an independent, from-scratch recomputation
+    of the candidate set (not a re-run of the pipeline's own function) and
+    against a lead's own manual single-shop, single-rubric calculation, both
+    matching exactly.
+
+steps:
+  - "Read the recommendation source as-is before assuming its structure: here, one Redis key per shop_id, value a JSON object keyed by the service's own per-shop rubric id, each holding a score-sorted (or not - sort defensively) list of [book_id, score] pairs. Take the top-N per rubric, then union across all of a shop's rubrics and dedupe by (shop_id, book_id) - the rubric id is only a selection device, never used again once candidates are built, and the final replace decision is purely by (shop_id, book_id)."
+  - "The replace rule is a strict three-way split with no middle ground: forecast > 0 is never touched regardless of candidate status; forecast == 0 and the pair is a candidate becomes qty=1 with a source flag; forecast == 0 and not a candidate stays 0. Keep qty and source as the only two output columns beyond the keys - the recommendation service's score is a relevance ranking signal for selecting the top-N, not a quantity, and must never be written into qty."
+  - "Before assuming a low patch rate is a shortfall, decompose it: check what fraction of the model's zero-forecast population the recommendation service simply doesn't rank at all (a real ceiling, not a bug), versus what fraction of the recommendation service's own candidates have no corresponding row in the forecast table to begin with (a scope boundary of the patch, not of the recommendation coverage). These are different failure modes needing different fixes, and conflating them produces the wrong diagnosis."
+  - "When candidates with no existing forecast row turn out to be the majority (73.3% here) rather than an edge case, switch the merge from how='left' (source table) to how='outer' and fill the resulting NaN forecast with 0 before applying the same three-way rule - the four resulting cases (untouched positive, replaced zero, unreplaced zero, newly added) are then non-overlapping and complete, with no separate code path needed for the new case."
+  - "A how='outer' merge on integer join keys of differing dtype (uint64 from one source, plain int64 from another) raises a TypeError from pandas trying to combine key values from both sides - this never surfaces under how='left', since left-merge keys are always taken from the left frame alone. Cast both frames' key columns to a matching dtype immediately before any merge that isn't guaranteed left-only."
+  - "Once row count is allowed to change (outer merge, not left), the row-count validation must be computed independently of the function under test - the union size of both inputs' key sets - rather than reusing the function's own output length, which makes the check tautological and catches nothing."
+  - "Never trust a 'candidates still match' recheck unless it runs within minutes of the pipeline's own read of the recommendation source. The same already-written batch, re-verified within ~10 minutes of the DAG run, matched with 0 missing and 0 extra; the identical check re-run roughly 24 hours later against the same stored batch (not a new one) showed ~35k missing and ~37k extra out of ~85k candidates - the external source moves faster than a same-day recheck accounts for, so a stale-looking mismatch on re-verification is not evidence of a code defect."
+  - "When an ID-keyed external scheme (here, the service's own per-shop rubric id, '0'..'57') looks unrelated to an internal one (the catalog's book_rubric_id) based on a single sampled bucket, sample several more before generalising - id '0' turned out to be a genuine catch-all with ~14% single-genre purity, while every other id (1-57) mapped to exactly one catalog rubric_name at 90-100% purity, identically across every shop checked. The first, single-bucket test produced the wrong general conclusion."
+  - "Add validation-window metrics to a pre-existing shared cross-team monitoring table rather than a new one if the team already has one (here analytics.ml_monitoring: date, model_name, metrics JSON) - prefix this project's model_name entries distinctly (bdf_) so they're filterable from the many unrelated models already logging there, and compute the metrics from the pipeline's own held-out tuning window before any final refit-on-everything step, since that is the only point with genuinely unseen data."
+
+notes: >
+  Redis: host reco-stage.cgorod.pw, port 6400, db 0, key = str(shop_id),
+  decode_responses=True. Value is ~2.5MB of JSON per shop; the *pre-truncation*
+  candidate count (rubric, book) pairs is identical across every shop checked
+  (141,351) - only the per-shop score ranking differs, so shops end up with
+  meaningfully different top-100 sets (pairwise Jaccard 7-36% across five shops
+  sampled) despite starting from the same underlying pool.
+
+  Output tables: analytics.book_demand_forecast_top_reco_60 and
+  analytics.book_demand_forecast_tail_reco_60. Schema: origin_date Date,
+  shop_id UInt64, book_id UInt64, qty Float32, source UInt8 (0=model,
+  1=recommendation service), upload_time DateTime. Plain MergeTree, same
+  non-replacing caveat as the forecast tables this reads from - see
+  other_book_demand_forecast_productionization.yml.
+
+  DAG chain as of 2026-09-04: book_demand_showcase_core_daily (cron 05:10) ->
+  book_demand_forecast_top_60 -> [book_demand_forecast_top_reco_60,
+  book_demand_forecast_tail_60] in parallel -> book_demand_forecast_tail_60 ->
+  book_demand_forecast_tail_reco_60. book_demand_top (network top-8000 ranking)
+  still runs on its own separate cron, not yet wired into this chain - see
+  memory note airflow-dag-chain-reorder-plan for the planned (not applied)
+  reorder.
+
+  Follow-up (2026-09-07): a combined assortment matrix was built after all -
+  book_demand_forecast_matrix, joining this pipeline's output with tail_reco_60
+  and a new third source (new-item distribution) - see
+  other_book_demand_forecast_matrix.yml. Still explicitly out of scope, owned
+  by another team: sorting that combined list by quantity and truncating it to
+  a per-shop shelf/stock limit. This pipeline's job still ends at handing over
+  the full patched list; do not add ranking or truncation here without an
+  explicit request.
+
+  Task 2 of the probation task list ("Прогноз продаж нового товара на первые
+  90 дней" - cold start for genuinely new products) remains entirely
+  unstarted. A planning conversation on 2026-09-04 found two blockers in the
+  one existing prototype for it (a train/test split that leaks by book_id, and
+  a dependency on a feature - historical 180-day network sales - that does not
+  exist at real prediction time for a new title). See memory note
+  cold-start-forecast-plan for the open questions to resolve before starting.

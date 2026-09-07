@@ -6,5 +6,41 @@ playbooks:
     work_type: "other"
     name: "Airflow rolling-window pipeline for ClickHouse showcase table"
     created: "2026-07-27"
-    usage_count: 1
+    usage_count: 2
     promoted_to_root: true
+  - file: "streamlit_clickhouse_dashboard_fixes.yml"
+    work_type: "other"
+    name: "Streamlit + ClickHouse analytics dashboard: common pitfalls and fix patterns"
+    created: "2026-07-30"
+    usage_count: 2
+    promoted_to_root: false
+  - file: "book_demand_forecast_model_tuning.yml"
+    work_type: "other"
+    name: "Hurdle-model iteration for book demand forecast: filter/feature/metric validation methodology"
+    created: "2026-08-07"
+    usage_count: 6
+    promoted_to_root: false
+  - file: "other_book_demand_forecast_productionization.yml"
+    work_type: "other"
+    name: "Productionizing a notebook demand forecast into Airflow DAGs (top-N and tail)"
+    created: "2026-08-28"
+    usage_count: 1
+    promoted_to_root: false
+  - file: "other_book_demand_reco_patch.yml"
+    work_type: "other"
+    name: "Patching zero forecasts with an external recommendation service (Redis)"
+    created: "2026-09-04"
+    usage_count: 1
+    promoted_to_root: false
+  - file: "other_book_demand_new_items_60.yml"
+    work_type: "other"
+    name: "Distributing a network-wide new-item forecast across Moscow shops"
+    created: "2026-09-07"
+    usage_count: 1
+    promoted_to_root: false
+  - file: "other_book_demand_forecast_matrix.yml"
+    work_type: "other"
+    name: "Combining top/tail/new-item forecasts into one assortment matrix, and the shop-list bugs found along the way"
+    created: "2026-09-07"
+    usage_count: 1
+    promoted_to_root: false

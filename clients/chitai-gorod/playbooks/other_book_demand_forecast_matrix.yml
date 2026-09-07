@@ -1,0 +1,96 @@
+# clients/chitai-gorod/playbooks/other_book_demand_forecast_matrix.yml
+# Schema: frameworks/daneel/templates/playbook_client.yml (#274)
+
+name: "Combining top/tail/new-item forecasts into one assortment matrix, and the shop-list bugs found along the way"
+client: "chitai-gorod"
+contact: null
+work_type: "other"
+created: "2026-09-07"
+issue_ref: null
+usage_count: 1
+promoted_to_root: false
+
+context:
+  problem: >
+    The lead asked for one combined table (shop_id, book_id, forecast,
+    origin_date, segment) out of the three existing forecast pipelines
+    (book_demand_forecast_top_reco_60, _tail_reco_60,
+    book_demand_forecast_new_items_60), ordered new-then-top-then-tail. The
+    three pipelines determine "which Moscow shops exist" independently, by
+    three different mechanisms, and none of the three lists actually
+    matched each other or a real internal ordering system
+    (analytics.book_demand_internal_results) once compared directly.
+  outcome: >
+    Shipped book_demand_forecast_matrix, a DAG with no ML model - just
+    read-dedupe-restrict-write. Two real bugs found and fixed in top_60's
+    own shop filter (both also copied into new_items_60's independent
+    copy of the same filter, fixed there too); a third bug in tail's shop
+    inheritance mechanism found but deliberately not fixed at the source -
+    instead neutralized once, at matrix-assembly time, by restricting the
+    whole matrix to top's shop list. First real run: 2,026,521 rows, 80
+    shops, matches the real internal ordering system's Moscow shop count
+    exactly except for 5 shops correctly excluded as too new (<180 days).
+
+steps:
+  - "When three pipelines are each supposed to represent the same real-world set (here: 'the Moscow shops that exist') but compute it independently, don't assume they agree - diff the actual (shop_id) sets pulled from each table's live data before building anything on top of them. This surfaced three real bugs that had been sitting silently in production."
+  - "A working, independent external ground truth beats reasoning about your own filter in isolation. analytics.book_demand_internal_results (the real internal ordering system - Target_Zak, Target_Remainder, LikvMonth) turns out to already encode 'is this a real, currently-ordering shop' - joining against its most recent snapshot (own latest date, not a shared date) exposed exactly which of our shops were wrong, in which direction, without having to guess at retail_shops_info semantics from first principles."
+  - "Before writing a comparison-by-name filter, verify how the SQL engine's own string functions handle the alphabet you're filtering on. ClickHouse's lower() and LIKE are ASCII-only and silently no-op on Cyrillic - a `lower(name) LIKE '%ярмарка%'` filter matched zero rows even against a table with 11 obviously-matching entries, and looked like 'no such rows exist' rather than 'the filter is broken'. Use positionCaseInsensitiveUTF8() (or lowerUTF8()) for any non-ASCII text match."
+  - "A field that looks like it should mean the same thing as a nearby, already-correct field (here: date_transport_stop looking like it should parallel date_closed's 'IS NULL OR > cutoff' pattern) may not actually behave that way - check its value distribution before copying the pattern. Here, 9 of 11 shops with the field set also had date_closed set (transport typically stops 2-6 weeks before formal closure - the field is a leading indicator of closure, already covered by date_closed), while the 2 exceptions were shops still actively trading with a stale, past-dated value that a '> cutoff' comparison would still exclude. The actual fix was to drop the redundant condition entirely, not to add a date comparison - the first hypothesis (matching date_closed's pattern) would not have worked and wasn't caught until checking the full value distribution, not just the two known-bad shops."
+  - "A shop-format anomaly can be filtered by name even when every structured field (channel_id, type_id, brand, dates) makes it indistinguishable from a real shop. Two 'ярмарка' (book-fair stand) entries had channel_id=1 and type_id=3, identical to real shops, and were only identifiable by short_name/full_name containing 'ярмарка' - structured-field filters alone would never catch this class of bad data; check name text too when auditing a shop or location list for anomalies not just found before."
+  - "Two pipelines can silently disagree on whether a shop exists in different directions - one caused by a broken filter condition (top_60 missing two real, actively-trading shops due to the date_transport_stop bug), one by a stale-inheritance mechanism (tail keeping a closed shop because it inherits its shop scope from historical showcase fact rows rather than a fresh, cutoff-aware query against retail_shops_info). These need different fixes and produce opposite symptoms (missing vs. extra) - don't assume one root cause explains both."
+  - "When one of several inputs to a combined output has already-correct source-of-truth data (here: top_60, after its two bugs were fixed) and the others don't, and fixing the others at the source is out of proportion to the task (tail's fix would touch the shared showcase query that also feeds model training, a materially bigger and riskier change than a shop-filter tweak), restrict the combined output to the correct input's key set at assembly time instead. This is a legitimate fix, not a workaround: it doesn't hide the other pipelines' bugs (they're still visible directly, by design, if anyone queries book_demand_forecast_tail_reco_60 on its own) but it stops them from reaching the delivered artifact."
+  - "Before re-running a pipeline whose bug you just fixed, check whether it has a same-day idempotency guard (an already_done check that returns without recomputing if origin_date already has rows) - if it does, a same-day re-trigger after a fix silently no-ops rather than picking up the new code, and looks identical in the logs to a successful run. None of book_demand_forecast_top_reco_60, _tail_60, or _tail_reco_60 have this guard at all (top_60 and new_items_60 do) - the two without it don't silently skip on a same-day re-trigger, they silently double-write instead, appending a second copy of the day's rows on top of the stale ones, since none of these tables are ReplacingMergeTree. Check for the guard's presence (or absence) in the specific pipeline before re-triggering, not just assume one behavior for the whole DAG family - and either way, delete the day's existing rows before a same-day re-trigger meant to pick up a fix."
+  - "A cross-team query joining an external system to one of these forecast tables on exact date equality (origin_date = toDate(upload_time)) will show a hard zero for 'today' as a structural artifact whenever the forecast table's own daily run lags real time by a day (normal for this whole pipeline family) - not because shops are actually missing. Recognize this shape (works for all past days, zero for the most recent) before investigating it as a data-coverage bug."
+
+notes: >
+  Table: analytics.book_demand_forecast_matrix. Schema: origin_date Date,
+  shop_id UInt64, book_id UInt64, forecast Float32, segment
+  LowCardinality(String) ('new'/'top'/'tail'), upload_time DateTime.
+  MergeTree, not Replacing - same delete-before-rerun caveat as every other
+  table in this family.
+
+  Assembly logic: read each of the three segments at its own latest
+  origin_date (they can and do lag independently); de-duplicate
+  (shop_id, book_id) pairs across segments by priority new > top > tail
+  (matches the requested display order) via NOT IN subqueries in each
+  segment's own SQL, not a later pandas step; concatenate; then restrict
+  the whole result to the shop_id set actually present in the top segment
+  for that run - this is the single point that neutralizes tail's and
+  new_items_60's own shop-list problems without editing either pipeline.
+  proba was deliberately left out of the schema (not requested, and would
+  have needed an extra join to the base tail table plus a decision about
+  rows the reco-patch added with no underlying model row to source it
+  from - see other_book_demand_reco_patch.yml for that patch mechanism).
+
+  Two real bugs fixed 2026-09-07 in book_demand_forecast_top_60_pipeline.py
+  (shop CTE) and identically in book_demand_forecast_new_items_60_pipeline.py's
+  own copy: dropped `AND date_transport_stop IS NULL` entirely (see step 4
+  for why), added `AND positionCaseInsensitiveUTF8(short_name, 'ярмарка') = 0`
+  and the same for full_name. Confirmed real-data effect: top gained shops
+  243 ("Отрадное") and 416 ("Электрозаводская 4"), lost 463/486 (both
+  "Ярмарка..." stands) - net still 80 shops. The identical bug also sits
+  unfixed in book_demand_showcase_core_sql.py's own copy of this filter,
+  which is what tail actually inherits its shop scope from - not fixed
+  here (bigger blast radius, feeds model training too), worked around at
+  matrix-assembly time instead per step 6. Shop 822 ("Свиблово", closed
+  2026-08-16) is the other known tail-only issue, same workaround applies.
+
+  DAG chain as of 2026-09-07: book_demand_forecast_matrix has NO trigger
+  into it from anywhere in the existing chain (showcase_core_daily ->
+  top_60 -> [top_reco_60, tail_60, new_items_60] in parallel, tail_60 ->
+  tail_reco_60) - it only runs on manual trigger via the Airflow UI. Adding
+  an automatic trigger (from the end of the slowest branch, tail_reco_60,
+  or by making the whole chain sequential to remove the race where matrix
+  could read top_reco_60/new_items_60 before they've actually finished) is
+  a deliberately deferred decision, not an oversight - see chat history
+  2026-09-07 for the sequential-vs-parallel tradeoff discussion.
+
+  Verification: notebooks/production/book_demand_forecast_matrix_check.ipynb
+  (self-contained, no pipeline imports) - rebuilds the same logic from
+  scratch, checks source-date drift, shop coverage vs both internal_results
+  and each segment's own source table (with per-shop reason classification:
+  too-new / closed / date_transport_stop / unexplained), sum reconciliation
+  against each source table's raw totals, a random per-row sample cross-
+  check against source tables, and duplicate/zero-vs-positive counts - then
+  the same checks again directly against the real written matrix table
+  after the DAG actually ran, not just against the in-notebook recomputation.

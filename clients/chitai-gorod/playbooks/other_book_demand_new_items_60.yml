@@ -1,0 +1,65 @@
+# clients/chitai-gorod/playbooks/other_book_demand_new_items_60.yml
+# Schema: frameworks/daneel/templates/playbook_client.yml (#274)
+
+name: "Distributing a network-wide new-item forecast across Moscow shops"
+client: "chitai-gorod"
+contact: null
+work_type: "other"
+created: "2026-09-07"
+issue_ref: null
+usage_count: 1
+promoted_to_root: false
+
+context:
+  problem: >
+    An external table (analytics.sales_predictions_30d) already gives a
+    network-wide, 180-day sales forecast per new-item book_id - no shop or
+    city breakdown at all. The task was to turn that into shop_id, book_id,
+    qty for the ~80 Moscow shops on a 60-day horizon, as the third input
+    (alongside top-N and tail) to a combined assortment matrix. Not to be
+    confused with the separate, still-unstarted probation task of
+    forecasting a new title's *total* network volume from scratch (see
+    memory note cold-start-forecast-plan) - this task starts from an
+    already-existing network total and only handles the distribution half.
+  outcome: >
+    Shipped book_demand_forecast_new_items_60, a daily DAG with no ML model
+    - two empirically-calibrated coefficients (network 180d -> network 60d,
+    network -> Moscow) applied to the existing forecast, then a per-book
+    integer distribution across shops by weighted lottery. First real run:
+    2757 books, 9998 total units, all 80 Moscow shops used, top shop capped
+    at 5.2% of all units and 13.3% of books - not concentrated in one store.
+
+steps:
+  - "Before designing a distribution mechanism, check the actual scale of what you're distributing - querying the real predict column showed 72% of books had the network-wide minimum value (10, over 180 days), meaning most individual books would resolve to 0-2 Moscow units total. That number, not a hypothetical, should drive every downstream design choice."
+  - "Compute both conversion coefficients (network-180d -> network-60d ramp-up share, network -> Moscow share) empirically from historical books of comparable scale to the ones being forecast, not from the full historical population. On this data the two ways of averaging (per-book mean vs. pooled sum-of-parts) diverged sharply on the full population (0.67 vs 0.41) because tiny-volume books distort a per-book average, but converged closely (0.49 vs 0.48) once restricted to books in the same order-of-magnitude as the target population - convergence itself is evidence the estimate is stable at that scale."
+  - "Recompute calibration coefficients like these live in the pipeline rather than hardcoding them, once you've timed the queries - here both coefficient queries together ran in ~21s against the model retraining runtime of other DAGs in the same chain (tens of minutes), so freshness was nearly free. Don't assume a coefficient needs periodic offline recalibration until you've actually measured what a live recompute costs."
+  - "When most individual allocations resolve to a single unit spread over dozens of candidate locations, the standard largest-remainder apportionment method silently breaks: at total=1 its 'largest remainder' is just the largest weight, so it deterministically picks the same top-weighted shop for every such case. On this data that sent 29% of all units to one shop. Replace it with a weighted lottery (floor(weight*total) guaranteed per location, weighted sampling without replacement for the leftover, seeded by the item's own id for reproducibility) - the aggregate outcome still matches the weight distribution, but individual allocations spread out. Confirm the fix with a concrete measurement (here: top-location share dropped from 29% to ~5%), not just by reasoning that it should work."
+  - "A merge-based apportionment can silently cap out for the rare high-volume input if using weighted sampling without replacement alone (can't select more distinct locations than the location count). Fix by combining a deterministic floor(weight*total) base allocation with weighted-sampling-without-replacement only for the remainder - this also naturally subsumes the total=1 case and removes the need for a separate branch."
+  - "Two independent copies of the same 'valid Moscow shop' filter (this pipeline's own, and the unrelated top_60 pipeline's) had drifted apart by two real bugs (see other_book_demand_forecast_matrix.yml for the fixes) - a filter this consequential, copy-pasted into a second pipeline for lack of a shared import convention in this codebase, needs the same fix applied to every copy, not just the one you happen to be looking at."
+
+notes: >
+  Table: analytics.book_demand_forecast_new_items_60. Schema: origin_date
+  Date, shop_id UInt64, book_id UInt64, qty Float32, upload_time DateTime.
+  MergeTree, no ReplacingMergeTree - see other_book_demand_forecast_matrix.yml
+  notes for the standard delete-before-rerun procedure this implies.
+
+  Coefficients as computed 2026-09-07: COEF_60_OF_180 ~= 0.48 (share of the
+  180-day network forecast realized in the first 60 days), MOSCOW_SHARE ~=
+  0.22 (share of network sales landing in Moscow ЧГ/Буквоед shops). Both
+  recomputed live every run from analytics.ncat_first_180d_period_sales and
+  analytics.cdm_retail_receipts - not hardcoded constants, see step 3.
+
+  Shop weight = a shop's share of total book sales over the trailing 180
+  days (analytics.cdm_retail_receipts, same quality filters as top_60's
+  history query) - one static vector shared by all books in a run, not
+  book- or rubric-specific. This is deliberately the "light version" cut
+  corner: no per-rubric weighting, no elapsed-days correction on the
+  180d->60d share, no retrospective validation of the distribution policy
+  against how comparable historical launches actually spread. Revisit if
+  there's ever time for a fuller version.
+
+  Feeds into analytics.book_demand_forecast_matrix as the "new" segment -
+  see other_book_demand_forecast_matrix.yml for how it's combined with top
+  and tail, and for the two shop-list bugs this pipeline's own copy of the
+  Moscow-shop filter also had (date_transport_stop, ярмарка stands) until
+  fixed 2026-09-07.
