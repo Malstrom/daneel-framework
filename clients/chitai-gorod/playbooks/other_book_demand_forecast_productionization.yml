@@ -1,0 +1,129 @@
+# clients/chitai-gorod/playbooks/other_book_demand_forecast_productionization.yml
+# Schema: frameworks/daneel/templates/playbook_client.yml (#274)
+
+name: "Productionizing a notebook demand forecast into Airflow DAGs (top-N and tail)"
+client: "chitai-gorod"
+contact: null
+work_type: "other"
+created: "2026-08-28"
+issue_ref: null
+usage_count: 1
+promoted_to_root: false
+
+context:
+  problem: >
+    Take a demand-forecast model that works in a research notebook and ship it
+    as a scheduled Airflow pipeline writing to ClickHouse, splitting the catalog
+    into complementary populations so each gets an architecture suited to its
+    sparsity. Research code lives in /Users/nikita/Project/test with a shared
+    lib/ package and parquet caching; production code must live in
+    /Users/nikita/Project/airflow with no cross-repo imports, no caching, and
+    logger output only. Recurring risks: silently forecasting for shops that
+    have closed, reading unfiltered reference tables that dominate runtime,
+    dropping population subsets so they vanish from the output table instead of
+    appearing as zeros, and fitting calibration or thresholds in-sample so the
+    probabilities the forecast depends on are systematically overconfident.
+  outcome: >
+    Shipped two complementary pipelines writing 60-day-ahead forecasts.
+    book_demand_forecast_top_60 covers the network top-2000 books in warm
+    Moscow pairs (stock held 30+ days) with a direct Tweedie CatBoost regressor,
+    no classifier - hurdle lost to direct regression at every N/W configuration
+    tested. book_demand_forecast_tail_60 covers everything else, excluding the
+    top-2000 in SQL at history load so the two pipelines never overlap, with a
+    hurdle model (classifier x conditional regressor) and two tiers: network
+    ranks 2001-8000 get ceil(proba*qty) above a recall-targeted threshold,
+    everything below gets 1 when proba >= 0.5 with the regressor not run at all.
+    Chained showcase_core_daily -> top_60 -> tail_60 via TriggerDagRunOperator.
+    First full tail run: 739,173 rows written, ~80 minutes end to end. Metrics on
+    the held-out window are poor and understood, not mysterious: tier 1
+    over-forecasts 1.7x (WAPE 1.34) because its threshold is picked purely for
+    recall with no regard to error, tier 2 catches 5.4% of actual sellers
+    because a fixed 0.5 cutoff on calibrated probabilities almost never fires in
+    an 11%-base-rate population. Threshold policy left unchanged pending an
+    explicit business decision on error-vs-coverage.
+
+steps:
+  - "Split the catalog into non-overlapping populations before anything else, and make the split come from one source of truth: rank books network-wide from the receipts table (never from a city-scoped showcase, which self-filters), take the top-N for one pipeline, and exclude exactly that ID set in the other pipeline's history SQL with `AND book_id NOT IN (...)`. Both pipelines must use the same ranking function and the same window length, or the populations drift apart."
+  - "Choose the architecture per population by sparsity, not by habit: on a dense top-N a direct regressor beat a hurdle model at every configuration tested; on the sparse tail the hurdle split (will it sell / how much) is what makes the problem tractable at all."
+  - "Date-filter every reference table read. An unfiltered behavioural/analytics table cost 2077s and 136M rows on the first run; adding `event_date >= history_start` cut it to 60s and 47M. Check each reference query for a missing time predicate before the first production run, not after."
+  - "Filter the shop universe explicitly in every pipeline, evaluated at the forecast cutoff. Do not inherit shop scope from a historical showcase table: the showcase accumulates rows written when each shop was still open, so reading it yields every shop that was ever active in the loaded window, including closed ones."
+  - "Drop dead pairs before feature building, not after scoring - compute days-since-last-sale over the full history (not the feature window, which caps the value at its own length) and cut pairs past the threshold. This is the main runtime lever on a long tail; it removed 855k of 1.59M pairs. Then decide explicitly whether those pairs should be absent from the output table or written as zeros - absence and zero mean different things to a downstream consumer."
+  - "Return pairs that are alive but fall outside the feature window (sold between the window length and the dead-pair threshold): rebuild their attribute features from the same aggregates, zero the window-scoped features honestly, and keep the longer window-sales features, which do still see their sales. Verify both branches on synthetic data - this is the most intricate code in the pipeline and its failures are silent."
+  - "When the model has fitted post-processing (probability calibration, decision thresholds), hold out the most recent window from training, fit those on it, then refit the base models on all windows with the iteration counts frozen from stage one. Calibration and thresholds are fit parameters, not hyperparameters: fitting them on data the model memorised makes probabilities overconfident and the threshold too aggressive. If the model has no such post-processing, no holdout is needed - train on everything."
+  - "Store the probability and the population/tier label alongside the forecast when any tier emits a constant value. A tier where every positive forecast equals 1 cannot be ranked by forecast, and the same number means an estimated quantity in one tier and a fired flag in another."
+  - "Write the pipeline as a self-contained module under scripts/ml_team/ml_pipeline/<domain>/: inline everything the research repo imported from lib/, no caching of any kind (direct queries only), logger with %-style args instead of print, docstrings of three to five words without trailing periods, section banners, and an orchestrator `run_<name>_job(client, run_day=None)` that the DAG task calls after opening the client."
+  - "Raise on structural violations before the INSERT (empty frame, duplicate pairs, negative or non-integer forecasts, probabilities outside [0,1], row count mismatch, tier-specific value constraints) so a bad run fails the task and fires the alert callback instead of silently writing."
+  - "Pass `send_receive_timeout` to the connection helper for any job running longer than a few minutes - a multi-hour run will otherwise lose its socket during long gaps between queries."
+  - "Mirror the existing DAG file conventions exactly: fixed `start_date`, `catchup=False`, `max_active_runs=1`, the team's `on_failure_callback`, domain tags, and `schedule_interval=None` when the DAG is triggered by another. Chain with `TriggerDagRunOperator(wait_for_completion=False, reset_dag_run=True)` when the downstream DAG only needs ordering, not the upstream's output."
+  - "Run the notebook version end to end against production data and read the actual numbers before wiring the DAG - runtime, row counts, held-out metrics, ratio of forecast volume to the last comparable period of fact. Port the code only after that, so what ships is verified rather than assumed."
+
+notes: >
+  Follow-up (2026-09-04): both pipelines now feed a second DAG each
+  (book_demand_forecast_top_reco_60, book_demand_forecast_tail_reco_60) that
+  patches remaining zeros using an external recommendation service - see
+  other_book_demand_reco_patch.yml for that methodology. The tail DAG also
+  gained a tier=0 category for dead pairs (no sale in 300+ days) that used to
+  be silently absent from the output table rather than written as zero - see
+  that playbook's notes for the current full DAG chain.
+
+  Table schemas. analytics.book_demand_forecast_top: origin_date Date, shop_id
+  UInt64, book_id UInt64, forecast Float32, upload_time DateTime.
+  analytics.book_demand_forecast_tail adds proba Float32 and tier UInt8. Both
+  MergeTree PARTITION BY toYYYYMM(origin_date) ORDER BY (origin_date, shop_id,
+  book_id). Neither is ReplacingMergeTree: a manual rerun on the same
+  origin_date appends duplicates rather than replacing, so delete the day's rows
+  first when rerunning after a failure. Scheduled runs are safe because
+  origin_date advances daily.
+
+  ClickHouse driver gotcha (2026-08-27): origin_date must be a datetime.date
+  object, not an ISO string. Passing a string fails inside serialisation with
+  `AttributeError: 'str' object has no attribute 'year'` on a Date column - the
+  error surfaces deep in the driver and does not name the column.
+
+  Shop scope discrepancy (2026-08-28, unresolved). The top pipeline forecasts
+  for 80 Moscow shops, the tail for 83, because the top re-queries
+  retail_shops_info at the cutoff while the tail inherits whatever shops sit in
+  the showcase table. Three shops differ. Shop 822 closed 2026-08-16, ten days
+  before the cutoff - the tail is forecasting demand for a closed store, which
+  is a genuine defect and the reason step 4 exists. Shop 243 has
+  date_transport_stop = 2026-08-31, i.e. in the future relative to the cutoff,
+  and is still trading; it is dropped by the top pipeline because the filter
+  tests `date_transport_stop IS NULL` without comparing the date, while the
+  adjacent condition for closure does compare (`date_closed IS NULL OR
+  date_closed > cutoff`). That asymmetry looks like a bug in the top pipeline
+  and in the showcase SQL it was copied from, so fixing it changes something
+  already running in production - treat as a separate task. Shop 665 passes
+  every listed condition and is still unexplained; the remaining candidates are
+  city/brand (not inspected) or simply having no warm pair among the top-2000,
+  which is a different mechanism from the shop filter.
+
+  Tail threshold policy (2026-08-28, decision pending). The two tiers fail in
+  opposite directions and neither setting was chosen deliberately - each is a
+  side effect of how its threshold is derived. Tier 1 uses
+  find_tau_for_recall(target=0.8), which lowers the cutoff until 80% of sellers
+  are caught while never looking at error; in a population where only 32.7% of
+  pairs sell, that necessarily fires on a large majority of non-sellers, and
+  ceil rounding turns each false positive into at least one unit of error -
+  hence forecast 210,814 against fact 124,590. Tier 2 uses a fixed 0.5 on
+  calibrated probabilities where the base rate is 11%, so it almost never
+  fires: 4,501 forecast against 51,837 fact, recall 0.054. Worth knowing before
+  changing it: 0.5 is close to WAPE-optimal for tier 2 given its average basket
+  of 1.13 units, so lowering it trades error for coverage rather than fixing a
+  mistake. The real question is which the buyers need, and that has not been
+  put to them.
+
+  Expectations for the tail, for conversations with the lead: overall WAPE 1.24
+  on the held-out window against roughly 0.67 for the top-2000 pipeline. This
+  is a property of the data, not a broken model - the tail is far sparser, and
+  a 30% target is not reachable there with a model of this class. Held-out
+  metrics are additionally optimistic because the same window drives early
+  stopping, calibration and threshold selection; a genuinely independent fourth
+  window does not fit in the ~390 days of showcase history at the current window
+  sizes (120-day features, three 60-day window-sales lookbacks).
+
+  Runtime profile of the first full tail run (2026-08-27): history load 440s for
+  438M rows, reference tables 72s, feature frames 46.6 min across three training
+  windows plus the prediction frame, probe training 9.7 min, refit on all
+  windows 10.4 min, insert 8.7s. The regressor stopped at iteration 1490 of a
+  1500 ceiling, meaning early stopping never fired and more trees may still
+  help - untested.

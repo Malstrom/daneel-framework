@@ -1,0 +1,105 @@
+# clients/chitai-gorod/playbooks/streamlit_clickhouse_dashboard_fixes.yml
+# Schema: frameworks/daneel/templates/playbook_client.yml (#274)
+
+name: "Streamlit + ClickHouse analytics dashboard: common pitfalls and fix patterns"
+client: "chitai-gorod"
+contact: null
+work_type: "other"
+created: "2026-07-30"
+issue_ref: null
+usage_count: 2
+promoted_to_root: false
+
+context:
+  problem: >
+    A Streamlit app backed by ClickHouse (book-demand forecast dashboard:
+    analytics.book_demand_forecast_weekly / book_demand_forecast_week_experiments)
+    needed a round of fixes within a tight (~30 min) window: one page loaded a
+    full fact table into the browser (slow in prod), an Altair chart silently
+    failed to render, a slider hid rows behind a manual threshold instead of
+    ranking them, and a couple of pages crashed on partial date-range input.
+    No local run and no ClickHouse access were available during the session
+    (no corporate VPN) - all fixes had to be made from reading the code and
+    reasoning about Streamlit/Altair/ClickHouse behavior, then verified by the
+    operator separately.
+  outcome: >
+    Replaced the raw-table page with server-side aggregates (GROUP BY / sum /
+    quantile queries) plus a fixed small top-N chart set; fixed the
+    log-scale-on-bar-chart rendering bug; removed a "minimum pairs" slider in
+    favor of sorting by contribution to total error; added guards for partial
+    st.date_input selections; centralized st.set_page_config for
+    st.navigation; fixed side-by-side horizontal bar charts that were
+    crowding out their own axis labels. All changes were code-only - no DB
+    credentials touched, no local server started, per operator instruction.
+
+steps:
+  - "If a page loads a full fact/showcase table into `st.dataframe` just so the user can eyeball it, treat that as a page needing redesign, not a table needing a bigger LIMIT: push the aggregation into the ClickHouse query (GROUP BY, sum, quantile, avg(x > threshold)) and render metrics + Altair charts + at most a small fixed top-N table. This keeps prod page-load time independent of table size."
+  - "Never pair `mark_bar()` with a `scale(type=\"log\")` axis that includes a zero baseline - Vega-Lite can't render bars against a log(0) baseline and the chart silently renders blank (no error surfaced to the user). Use `type=\"symlog\"` instead when the data can legitimately be zero."
+  - "`st.date_input(..., value=(start, end))` returns a 1-tuple while the user has only picked the first date of the range - unpacking it immediately (`date_from, date_to = st.date_input(...)`) crashes with `ValueError` on every range pick. Always read it into a single variable first and guard `if len(date_range) != 2: st.stop()` before unpacking."
+  - "With `st.navigation`, call `st.set_page_config` exactly once, in the entry-point script, before `pg.run()` - not on every page. Duplicate calls on later pages are wasted at best and can throw depending on Streamlit version."
+  - "When a slider exists only to hide noisy/small rows (e.g. 'minimum pairs in group'), prefer replacing it with an intrinsic ranking - sort by contribution to the metric that actually matters (e.g. share of total error/volume) instead of asking the user to hand-tune a cutoff. Removes a knob, and small/noisy groups naturally fall to the bottom instead of needing to be excluded."
+  - "For horizontal bar charts with long categorical labels, don't place two of them side by side in half-width `st.columns` - Vega-Lite starts truncating or skipping axis labels once the available space per category gets tight. Give each chart the full container width (stack them instead) and set `axis=alt.Axis(labelLimit=...)` explicitly for long text."
+  - "When a numeric distribution histogram sits next to a headline metric built on a specific threshold (e.g. 'share of pairs with forecast > 1'), add that threshold as an explicit bucket boundary in the histogram - otherwise the chart and the metric visually disagree even though both are correct."
+
+notes: >
+  Session constraint worth remembering for this client: the operator
+  explicitly refused DB/local-run verification mid-task ("пароли от бд
+  оставляем, ты не лезь и не проверяй, у тебя нет корпоративного VPN" /
+  "нет, только правки кода") - treat that as a standing signal for this kind
+  of dashboard work unless the operator says otherwise in a given session:
+  make code-only fixes, explain the reasoning for each (especially rendering
+  bugs, which don't throw exceptions and are easy to get wrong twice), and
+  let the operator verify visually themselves rather than assuming CLI/VPN
+  access to ClickHouse.
+
+  Follow-up work (2026-08-03): different session, same dashboard, new class
+  of bugs found while wiring the model-quality pages up to a newly-fixed
+  training pipeline (see other_airflow_showcase_pipeline.yml / issue #18).
+  (1) A single `clickhouse_driver.Client` created once at module import and
+  shared across the whole process caused `PartiallyConsumedQueryError:
+  Simultaneous queries on single connection detected` under Streamlit's
+  multi-session/multi-thread execution - the driver isn't safe for
+  concurrent reuse of one connection. Fix: a factory function that opens a
+  fresh `Client` per query, called from the single `_execute_to_df`
+  choke-point, not a module-level shared instance. (2) A sidebar filter
+  defaulting to "last item" in a model-version multiselect
+  (`versions[-1:]`) silently scoped every quality page to whichever
+  exploratory run happened to sort last, once version tags stop being
+  perfectly disciplined (e.g. v1/v2/v3 experimental suffixes). Removing the
+  filter to "show everything instead" is not the fix either - it blends
+  metrics across unrelated experimental runs (observed: WAPE computed as
+  sum(abs_error)/sum(den) across all logged runs came out ~189%, while any
+  individual run was far lower - a pure artifact of aggregating
+  incomparable runs together, not a real quality drop). The actual fix:
+  derive "the current model" from a source-of-truth table that only the
+  live production job writes (here, the forecast table itself), never from
+  a shared experiments/log table that also accumulates ad hoc runs under
+  similar-looking version strings. (3) A reference-table bug already found
+  and fixed in the underlying ETL (a rubric lookup scoped to a
+  new-releases-only catalog table instead of the full catalog) was still
+  present, independently, in three of the dashboard's own queries that
+  join the same raw reference table directly for display/enrichment -
+  fixing a join inside the pipeline does not fix ad hoc joins the
+  dashboard makes against the same raw source. Grep the dashboard's data
+  layer for every place a just-fixed source table is referenced before
+  considering the fix complete. (4) A "check freshness of N tables" health
+  page had no per-table error handling - one missing/erroring table (e.g.
+  one whose writer pipeline this session had no visibility into) would
+  take down the whole page instead of degrading just that one row; each
+  table's freshness check should be wrapped individually. (5) Confirmed and fixed: `pd.Timestamp.utcnow()` compared against
+  ClickHouse `DateTime` columns (`upload_time`/`run_ts`/`trained_at`) was
+  the bug predicted above - the cluster stores/returns those columns in
+  Europe/Moscow (UTC+3), not UTC. Diagnosed with no DB access, purely from
+  five `(last_update, hours_since_update)` rows the operator pasted from
+  the health page: solving `now = last_update + hours_since_update` for
+  each row independently converged on the same implied page-load time
+  (~16:09) across all five, while three of the raw `last_update` values
+  were ~2.7-3h later than that - a table cannot update in the future
+  relative to `now`, which is the signature of a timezone mismatch rather
+  than a real freshness problem. Fix: `health.py`'s `now` computed via
+  `pd.Timestamp.now(tz="Europe/Moscow").tz_localize(None)` instead of
+  `utcnow()`, so it matches the zone ClickHouse actually returns. General
+  lesson: this "back out the implied reference timestamp from several
+  independent rows and check they agree" trick works whenever a
+  cross-source time comparison looks wrong and there's no DB access to
+  just run `SELECT timezone()` directly.

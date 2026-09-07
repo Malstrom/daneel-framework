@@ -1,0 +1,168 @@
+# clients/chitai-gorod/playbooks/book_demand_forecast_model_tuning.yml
+# Schema: frameworks/daneel/templates/playbook_client.yml (#274)
+# Pruned 2026-08-28 from a 6-session raw journal (~14k tokens) to current-state
+# only - superseded intermediate findings and duplicate steps removed. Nothing
+# substantive dropped; see git history for the full session-by-session narrative
+# if ever needed.
+
+name: "Hurdle-model iteration for book demand forecast: filter/feature/metric validation methodology"
+client: "chitai-gorod"
+contact: null
+work_type: "other"
+created: "2026-08-07"
+issue_ref: null
+usage_count: 6
+promoted_to_root: false
+
+context:
+  problem: >
+    Improve WAPE of a CatBoost hurdle model (classifier x conditional
+    regressor) forecasting demand per (shop_id, book_id) pair over a fixed
+    forward window, fed by the showcase table from other_airflow_showcase_pipeline.yml.
+    Data is pulled read-only from /Users/nikita/Project/airflow, never
+    written there without asking first. Recurring risks: mistaking
+    validation noise for a real filter/feature/hyperparameter effect;
+    adding features without first checking which stage of the hurdle model
+    (classification recall, calibration, regression accuracy) is the actual
+    bottleneck; reporting one blended WAPE that structurally overstates
+    quality when the target is dominated by tiny integer actuals; tuning
+    threshold/calibration on the same data the model was scored on.
+  outcome: >
+    Final architecture (as of the 2026-08-19 v4 rebuild): two trained models
+    (classifier + Tweedie regressor) with isotonic calibration, threshold and
+    calibration fit on an origin held out from training entirely, split in
+    half by pair (one half for early-stopping eval_set, one for calibration +
+    tau selection) so neither is tuned on data it influenced. Ship two
+    forecast constructions from the same models: hybrid (p*q above tau, else
+    0) wins on pair-level WAPE (0.834) and is used for the "which pairs to
+    trust" ranking use case; expectation-value (p*q everywhere, no threshold)
+    wins at every aggregation level above the pair (shop x rubric: 0.215 vs
+    0.445 for hybrid) and is used for volume/ordering decisions. Reporting is
+    segmented, not a single blended number: classifier precision/recall/AUC
+    for the zero/nonzero decision, MAE for small nonzero actuals, WAPE only
+    for actuals large enough that the denominator is stable. tau=0.5 is
+    correct by construction once probabilities are calibrated (L1 loss's
+    optimum is the conditional median, zero below p=0.5) - not a tuned
+    parameter.
+
+    Confirmed and load-bearing: pair-level WAPE structurally cannot improve
+    much further - 81.4% zero-actual, 73.5% of nonzero actuals equal exactly
+    1, so minimizing WAPE (an L1 loss) converges toward predicting zero for
+    the ~90% of pairs below p=0.5; the classifier is well-calibrated in every
+    probability decile (AUC 0.787 honest, PR-AUC 0.649) so the ceiling is the
+    metric's shape at this grain, not model quality. This is why reporting
+    moved to segmented metrics and to aggregation-level forecasts.
+
+    300-day dead-pair cutoff is accuracy-neutral (0.8338 vs 0.8342 WAPE) but
+    cuts training rows 2.89M -> 973k and runtime 20 min -> 4.3 min - keep it
+    for cost, not accuracy; the discarded volume (23.8% of validation volume,
+    confirmed independently by direct SQL) is not recoverable with current
+    features.
+
+    Confirmed-ruled-out, don't re-test without a new reason: P(sale) x
+    E[qty] combination at pair level (worse WAPE than a hard threshold - it
+    smears residual noise across ~82% zero-actual pairs; wins decisively one
+    aggregation level up, see above - these are not the same finding);
+    restricting to ncat 1-7 (barely moves WAPE, 82% of pairs already in
+    range); Poisson vs Tweedie regressor loss (statistically
+    indistinguishable); rounding forecast to nearest integer once threshold
+    is tuned (adds nothing); scaling N_ORIGINS beyond 3 for more training
+    volume (zero effect - volume was never the bottleneck); multiplying
+    marginal calibration coefficients from two dimensions (squares the
+    correction - use iterative proportional fitting instead, and expect
+    coefficients fitted on one window to transfer poorly to the next); three
+    data-quality filters tested same-week on/off (ncat/category breadth,
+    pseudo-stockout, promo-touched) - all hurt WAPE, disabled but kept as
+    commented code with dated rationale.
+
+    Data-quality items closed: the suspected frozen-buggy-backfill
+    explanation for stalled WAPE was refuted by a flat weekly nonzero-share
+    across the full history (a code-audit hypothesis needs a live-data check
+    before being reported as fact). 1.54% of sold quantity never lands in
+    the showcase table (LEFT JOIN drops sales on days with no matching stock
+    snapshot - join keys themselves are correct, this is snapshot-coverage
+    gap only). October-November 2025 has doubled mean quantity-per-sale-line
+    (2.08-2.09 vs a stable 1.03-1.09 elsewhere) with sale-event count
+    unchanged - cause unresolved (candidates: duplicated receipt lines,
+    broken extract, genuine 2-for-1 promo), contaminates the earliest
+    training origin's feature window, handled via an EXCLUDE_ORIGINS switch.
+
+    Demand-concentration measurement (independent of the model, from the
+    showcase table directly): of 1.12M pairs with continuous stock presence
+    across 5 consecutive 60-day windows, 53.9% never sold in any of them
+    (confirmed dead assortment, not a stockout artifact - the showcase's
+    population filter has no sales condition), 39.4% sold in 1-3/5 (50.2% of
+    volume), 6.8% sold in >=4/5 (49.8% of volume, 117x a binomial-random
+    baseline). Basis for a proposed but not-yet-built three-regime split
+    (regular / intermittent / dead) - the regime label must be computable
+    strictly before the forecast cutoff or it is target leakage.
+
+    check_numbers.ipynb recomputes every published number from saved
+    parquets independent of the code that produced them: 126 checks, 125
+    passed, the one mismatch was an arithmetic slip in a summary document,
+    not the pipeline - this is what makes the numbers safe to put in front
+    of a lead.
+
+steps:
+  - "Before trusting any before/after WAPE comparison, confirm both runs used the same validation window - check the printed row/day count, don't assume. Keep a rolling-validation harness (N consecutive windows) so one lucky/unlucky window isn't mistaken for a real effect."
+  - "Test a candidate data-quality filter as a same-week on/off toggle, not by trusting its stated intent - a filter meant to remove noise can just as easily cut into the normal long tail of real sales. Disable filters that measurably hurt WAPE by commenting out only the application step with a dated rationale; don't delete the code."
+  - "When WAPE stalls despite adding features, decompose the error before adding more: zero vs nonzero actuals, by actual-quantity bucket, by classifier probability decile (calibration check), and regression-only error on true positives. This isolates which stage of the hurdle model is the actual bottleneck."
+  - "Before treating a per-pair metric as the headline number, check the population's zero/nonzero and integer-value structure. If minimizing it structurally converges on a degenerate solution (e.g. >70% zero actuals, nonzero remainder dominated by ones), the metric is diagnostic, not a target - recompute the forecast at the aggregation level the business actually acts on before concluding a construction doesn't work; one ruled out at pair level can win decisively one level up, because point-estimate bias, not variance, dominates the pair-level metric."
+  - "When a loss is L1 (WAPE, MAE), the optimal point forecast is the conditional median - zero for any event less likely than not - so an expected-value construction (P x E[value]) loses below p=0.5 and wins above it. Test per probability bin before accepting or rejecting it on the whole population, and note that a clean 0.5 switch point only holds if probabilities are calibrated."
+  - "A random row split leaks whenever the same entity appears in multiple time slices AND its id is a categorical feature - the model memorises the entity in one slice and is scored on it in another. Split by entity or by time, never by row, and treat a metric that improves when moving from a held-out time slice to a random split as evidence of leakage, not of a better model."
+  - "When the model has fitted post-processing (calibration, decision thresholds), hold out the most recent window from training entirely, split it by pair (not row) into an eval_set half and a calibration/threshold half, so neither is tuned on data it influenced."
+  - "Do not compare precision/recall across model versions without checking population, base rate and threshold all match first - removing easy negatives raises precision mechanically, lowering the threshold raises recall mechanically, and both are movements along one curve, not a better curve. Compare on a common population at matched precision, and report threshold-free measures (ROC-AUC, PR-AUC with its base rate) alongside."
+  - "Measure the cost of a population filter (e.g. dead-pair cutoff) by running the identical pipeline without it, not by reasoning about the volume it discards - the discarded volume is an upper bound on recoverable accuracy, not an estimate; training on the diluted population can make the classifier more conservative and not recover it anyway."
+  - "When a per-group metric is displayed as an aggregation-level metric, check whether it is summed across groups - relative error computed inside one group equals that group's bias by construction, so an unsummed table reads far better than the real thing."
+  - "Before claiming a model has reached its theoretical limit, check the decomposition is not circular - substituting the achieved accuracy on a covered subset back into a floor calculation reproduces the achieved total by construction. State only what the decomposition supports."
+  - "When the target is dominated by tiny integer actuals, segment reporting instead of one blended WAPE/MAPE: classification metrics for the zero/nonzero decision, MAE for small nonzero actuals (denominator too unstable), WAPE for larger actuals (denominator stable enough to be informative)."
+  - "Evaluate on the union of the model's population and the actual population (outer join), not a left join from actuals - pairs the model scored that never appear in the outcome window vanish along with their nonzero forecast otherwise, punishing misses but not false positives. Record population-membership flags before filling missing values."
+  - "Ground new candidate features in tables the client's other production pipelines already use (found read-only in their airflow DAG scripts) rather than speculative feature engineering. Verify a domain expert's claimed field cardinality empirically before modeling it (a claimed '1-7' range checked out to 100+ distinct values here), and check a derived combination feature's importance separately from its raw component - the combination can score much lower than the component alone."
+  - "Before accepting a code-review/git-history audit finding as the explanation for a metric problem, check it against live data with a simple aggregate query - a plausible narrative from reading code and commit history is a hypothesis, not a conclusion."
+  - "Cache every deterministic, reusable intermediate once iterating repeatedly (feature frames and trained models, not just raw query results), gated by an explicit schema-version string bumped on any feature-engineering change - and put every config flag that changes a cached artifact's content into the cache key itself, not just the schema version, or a filter switched on in config while the key ignores it silently serves stale frames."
+  - "When handing notebook functions to a standalone module for a different recipient/environment, extract mechanically (script-driven, not retyped) so the module is provably identical to the validated version. Re-check every ported SQL query for a dependency on a surrounding notebook cell's already-filtered state (e.g. an implicit date window) that the standalone version won't inherit - this class of bug is easy to introduce silently during a mechanical port."
+  - "Verify published numbers by recomputing them from saved artifacts (forecast, actuals, feature frames) in a separate check notebook that prints OK/MISMATCH per check, rather than by re-reading the code that produced them - it catches both pipeline errors and write-up arithmetic slips, and is what makes numbers safe to put in front of a lead."
+  - "Translate a threshold choice into the two quantities the business is actually arguing about (volume missed where forecast was zero, volume forecast where nothing sold) in units, per threshold, in one table - a debate framed as stockout risk versus shelf congestion needs an asymmetric answer from the business, not a symmetric accuracy metric from the analyst."
+  - "Maintain a plain-language pipeline-explainer doc once the operator can no longer track changes from code alone - update it in the same turn as any material pipeline change, not as a separate cleanup pass."
+
+notes: >
+  Current file map: production module /Users/nikita/Project/test/book_demand_forecast_60d.py
+  (no cache layer, inline plaintext credentials, held-out threshold tuning -
+  operator edits directly, diff against disk before regenerating);
+  working notebook /Users/nikita/Project/test/3_rolling_origins_v4.ipynb;
+  showcase-only diagnostics /Users/nikita/Project/test/chek_showcase_core.ipynb;
+  numeric-verification notebook /Users/nikita/Project/test/check_numbers.ipynb;
+  plain-language walkthrough /Users/nikita/Project/test/pipeline_explained.md
+  (written in the operator's own working language, kept updated alongside the
+  notebooks); lead-facing writeup /Users/nikita/Project/test/report_demand_forecast_2026_08_13.md.
+  This entire single-hurdle-model pipeline is the direct predecessor of the
+  split top-N/tail architecture in other_book_demand_forecast_productionization.yml
+  (book_demand_forecast_top_60 + book_demand_forecast_tail_60) - most of the
+  hurdle-specific methodology above (calibration-before-refit, dead-pair
+  cutoff cost measurement, tier/threshold tradeoff framing) carried forward
+  into the tail pipeline directly.
+
+  ClickHouse tables, read-only: analytics.tbl_manual (ncat, number_of_copies);
+  analytics.book_demand_internal_results (Target_ZakStd - already a 60-day-ahead
+  forecast as of its snapshot date, not a daily figure to sum; short
+  upload_time retention, ~10-11 days at last check); analytics.google_analytics_item_unq
+  (site_id=1, must filter book_id NOT IN ('(not set)','undefined','') AND IS
+  NOT NULL; joins directly on book_id, no id-space adjustment needed - unlike
+  the raw-matomo-based recsys_user_book_view.py pipeline, which subtracts
+  5000000 from ids over that threshold; don't copy that adjustment here).
+
+  Tooling: NotebookEdit requires an explicit `cell_type` to convert a cell's
+  type, otherwise it silently keeps the old type even if the new source reads
+  as markdown. Read has a ~25k token budget that large notebooks with
+  accumulated outputs can exceed - clear outputs first, or write the .ipynb
+  JSON directly (bypasses the Read-gate, safer than clear-and-restore when
+  outputs are worth preserving) - then re-run ast.parse over all code cells
+  as a sanity check.
+
+  Open items, none started as of 2026-08-19: three-regime split
+  (regular/intermittent/dead demand) proposed to the lead but not built; the
+  1.54%-of-quantity showcase leakage measured but not fixed at the pipeline
+  level; showcase eligible_shop_books still has no sales condition and is
+  anchored to today()-relative filters, so its pair population isn't
+  independent of when history was loaded; year-ago seasonal baseline not
+  computable with full window coverage until val_start_day >= 2026-07-31.
