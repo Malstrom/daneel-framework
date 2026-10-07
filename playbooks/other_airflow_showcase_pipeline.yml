@@ -34,3 +34,28 @@ notes: >
   is empty, backfills full history, and verifies rows were inserted; this
   was scoped but not built in the first implementation (source: chitai-gorod,
   issue #18).
+
+  Pitfalls found reusing this pattern (source: chitai-gorod, 2026-08-02):
+  (1) when the raw fact table has multiple similarly-named id columns,
+  verify empirically which one actually matches the dimension table's
+  id-space before joining on it — a wrong-but-plausible column silently
+  drops most rows with no error, it just under-counts. (2) A reference
+  table used to derive a filter can be scoped narrower than its name
+  implies (e.g. "new items only" instead of the full catalog) — confirm
+  its population actually covers the intended universe before trusting it
+  as a filter source. (3) Filter on the fact table's real partition/sort
+  key, not just the semantically relevant date column, or every run scans
+  the whole table regardless of the date range requested. (4) A source
+  table may represent a zero/empty state by omitting the row entirely
+  rather than writing an explicit zero/NULL — check the value distribution
+  before assuming "row missing" means "no data" rather than "zero". (5)
+  `NOT IN` silently drops NULLs on either side; wrap as
+  `(col IS NULL OR col NOT IN (...))` when NULL should pass through a
+  blacklist filter. (6, 2026-08-04) In ClickHouse specifically, don't use
+  `LEFT JOIN` + `IS NULL`/`IS NOT NULL` to detect missing/matching rows —
+  `join_use_nulls` is off by default, so an unmatched row gets the column's
+  type default (`0`, `''`) instead of NULL, and the `IS NULL` check silently
+  never fires. Looks like a clean 100% match / 0% missing regardless of the
+  real data, no error thrown. Use `LEFT ANTI JOIN` instead (or explicitly
+  `SET join_use_nulls = 1` for the session) — this cost a full afternoon of
+  re-checking "verified" numbers that turned out to be wrong.

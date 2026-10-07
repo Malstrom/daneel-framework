@@ -7,7 +7,7 @@ contact: null
 work_type: "other"
 created: "2026-09-04"
 issue_ref: null
-usage_count: 1
+usage_count: 2
 promoted_to_root: false
 
 context:
@@ -42,6 +42,8 @@ steps:
   - "Never trust a 'candidates still match' recheck unless it runs within minutes of the pipeline's own read of the recommendation source. The same already-written batch, re-verified within ~10 minutes of the DAG run, matched with 0 missing and 0 extra; the identical check re-run roughly 24 hours later against the same stored batch (not a new one) showed ~35k missing and ~37k extra out of ~85k candidates - the external source moves faster than a same-day recheck accounts for, so a stale-looking mismatch on re-verification is not evidence of a code defect."
   - "When an ID-keyed external scheme (here, the service's own per-shop rubric id, '0'..'57') looks unrelated to an internal one (the catalog's book_rubric_id) based on a single sampled bucket, sample several more before generalising - id '0' turned out to be a genuine catch-all with ~14% single-genre purity, while every other id (1-57) mapped to exactly one catalog rubric_name at 90-100% purity, identically across every shop checked. The first, single-bucket test produced the wrong general conclusion."
   - "Add validation-window metrics to a pre-existing shared cross-team monitoring table rather than a new one if the team already has one (here analytics.ml_monitoring: date, model_name, metrics JSON) - prefix this project's model_name entries distinctly (bdf_) so they're filterable from the many unrelated models already logging there, and compute the metrics from the pipeline's own held-out tuning window before any final refit-on-everything step, since that is the only point with genuinely unseen data."
+  - "Raising the recommendation top-N is not a lever for a total-units shortfall - it only widens speculative coverage. Measured 2026-09-09 (notebook notebooks/experiments/reco_threshold_coverage_top_tail.ipynb): for the top segment, 100->200 closes ~+5,083 more zero pairs (each exactly 1 unit). For tail, the replacement already dominates the model - at the live top-100, of tail's final output only ~29% (178,826 pairs) is the model's own nonzero forecast, ~15% (91,471) is model-zeros lifted to 1, and ~56% (344,617) is brand-new pairs the model never scored; ~71% of 'tail' is recommendation-driven at flat qty=1. Going tail 100->200 adds ~+439,061 units, 77% of them again brand-new speculative pairs. So top-200 would close the lead's reported 15% units gap with room to spare, but almost entirely by adding single-unit rows with no demand signal. The real levers for a units gap are tier-1's ceil(proba*qty) formula (deflates the regression quantity for every proba<1) and tier-2's flat 0/1 cap (never a quantity) - see book_demand_forecast_model_tuning.yml."
+  - "A rank-aware quantity for zero-replacement (lead's idea: rec rank 1-10 -> qty 10, 11-20 -> 8, ...) is more principled than raising N, but the step values must be calibrated from historical outcomes the same way the new-item coefficients are (what did pairs that sat in a shop's top-10 recs with a zero model forecast actually go on to sell?), not chosen by feel - and it changes what a source=1 row means downstream: it was a pure presence flag, it becomes a graded speculative quantity, which any consumer treating forecast as a calibrated estimate needs to be told."
 
 notes: >
   Redis: host reco-stage.cgorod.pw, port 6400, db 0, key = str(shop_id),
@@ -58,13 +60,20 @@ notes: >
   non-replacing caveat as the forecast tables this reads from - see
   other_book_demand_forecast_productionization.yml.
 
-  DAG chain as of 2026-09-04: book_demand_showcase_core_daily (cron 05:10) ->
-  book_demand_forecast_top_60 -> [book_demand_forecast_top_reco_60,
-  book_demand_forecast_tail_60] in parallel -> book_demand_forecast_tail_60 ->
-  book_demand_forecast_tail_reco_60. book_demand_top (network top-8000 ranking)
-  still runs on its own separate cron, not yet wired into this chain - see
-  memory note airflow-dag-chain-reorder-plan for the planned (not applied)
-  reorder.
+  DAG chain as of 2026-09-09: fully sequential -
+  book_demand_showcase_core_daily -> top_60 -> top_reco_60 -> tail_60 ->
+  tail_reco_60 -> new_items_60 -> book_demand_forecast_matrix (matrix now
+  auto-triggered for the first time). See other_book_demand_forecast_matrix.yml
+  notes for what was reverted alongside this rewiring and still to redo
+  (guards, shared shop-filter helper, tail_60 shop-restriction).
+
+  Threshold experiments: the older notebook
+  notebooks/experiments/zero_coverage_by_recommendations.ipynb covered the
+  top segment only on an 08-31 snapshot; the new
+  notebooks/experiments/reco_threshold_coverage_top_tail.ipynb refreshes
+  top on current data and adds the same threshold sweep (50/100/200/300/500)
+  for tail, separating "closed zeros" from "brand-new pairs added" since
+  tail_reco uses an outer merge.
 
   Follow-up (2026-09-07): a combined assortment matrix was built after all -
   book_demand_forecast_matrix, joining this pipeline's output with tail_reco_60

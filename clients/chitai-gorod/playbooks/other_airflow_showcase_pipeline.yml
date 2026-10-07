@@ -7,7 +7,7 @@ contact: null
 work_type: "other"
 created: "2026-07-27"
 issue_ref: 18
-usage_count: 1
+usage_count: 2
 promoted_to_root: true
 
 context:
@@ -33,6 +33,11 @@ steps:
   - "If a downstream DAG consumes this table (e.g. a forecast pipeline), chain a `TriggerDagRunOperator(wait_for_completion=False, reset_dag_run=True)` after the load task."
   - "Tag the DAG with team/domain/cadence tags (e.g. `clickhouse`, `showcase`, `<domain>`, `daily`, `<team>`) for discoverability."
   - "Before enabling the schedule, trigger the DAG manually once and confirm row counts in the task logs; only then let it run on schedule."
+  - "Load a multi-year history before enabling the schedule in step 6, from a notebook in fixed batches (weekly worked: 143 batches over 2.7 years) instead of one huge INSERT. Each batch: delete its window, assert 0 rows are left, insert, count the rows; after each finished batch write its start date to a JSON checkpoint next to the notebook; show progress with tqdm. Pass criterion: the checkpoint lists every batch and the per-week row counts show no empty week."
+  - "After any change of the query or the table schema, drop or truncate the table, delete the checkpoint and rerun every batch: the checkpoint records that a batch ran, not with which logic (a leftover checkpoint once kept 85 weeks on the old logic). Pass criterion: the first batch after the restart takes minutes, not seconds, and tqdm does not show millions of it/s."
+  - "Before the full history load of step 7, size the query on its first batch with read-only approximate diagnostics (count, uniq, sort and partition keys from system.tables, sizes from system.parts, the per-query memory limit and max_threads). If a batch hits the per-query memory limit (Code 241), rewrite the query (filter on the small side, compare numbers instead of strings, drop DISTINCT/pair sets that a filter already implies, and check on a sample what the rewrite changes) instead of changing settings on a shared production server. Pass criterion: the peak memory of a batch stays well below the limit."
+  - "While writing the SQL of step 1, store shop eligibility rules the business may want to change later as UInt8 flag columns computed per batch at window_end (bdf_core_full: shop_open_180d = date_opened <= window_end - 180, shop_transport_ok = date_transport_stop IS NULL, shop_is_fair = the name contains the fair marker), and keep hard filters only for conditions that clearly define the entity (bdf_core_full: channel_id = 1 and not closed at window_end; both still to be confirmed with the lead)."
+  - "After the load run and record read-only checks: count, uniq(shop), uniq(book), min and max day; bytes per row per column from system.columns; duplicate keys (GROUP BY day, shop_id, book_id HAVING count() > 1 must return nothing); rows per week (no missing week); comparison with the previous table on the overlapping period and scope."
 
 notes: >
   Follow-up needed: add a manual-only init DAG that (a) checks the target
@@ -42,3 +47,294 @@ notes: >
   original "fail if yesterday already exists" design — the rolling window
   is more forgiving of late-arriving source data but silently masks gaps
   older than the window.
+
+  Follow-up work (2026-08-02, issue #18): the v1 SQL had several correctness
+  bugs that under-counted sales, found while adding the id-based rubric
+  filter and 30-day age filter. Sales joined on the wrong id column
+  (cdm_retail_receipts.goods_id instead of goods_id_original — different
+  id-spaces from the catalog/stock tables), and the rubric filter sourced
+  from a new-releases-only table (ncat_first_180d_catalog) instead of the
+  full catalog, silently excluding the entire backlist. Both fixed and
+  verified: 0% of matched sales lost in the stock join, 84-90% of real
+  Moscow book sales fall inside the eligible-books scope. Also did a manual
+  one-time year backfill via DBeaver (TRUNCATE + single INSERT) — still not
+  the init DAG scoped in step 3/#18, that gap remains open.
+
+  Rule (2026-08-03, issue #18): do not source rubric/category data for this
+  pipeline from analytics.ncat_first_180d_catalog — confirmed new-releases-only
+  scope (see 2026-08-02 entry above), it silently excludes the backlist.
+  A new rubricator, analytics.book_ekn_rubric (book_rubric_id / book_rubric_name,
+  joined as recsys_catalog_pim.ekn = book_ekn_rubric.EKN_4), is the current
+  candidate replacement — still needs the standard checks before it's used in
+  the DAG: confirm EKN_4 is the right hierarchy level for recsys_catalog_pim.ekn
+  (table appears to carry EKN_1..EKN_4 levels), check for fan-out (multiple
+  rubrics per EKN, which would duplicate sales/stock rows on join), and measure
+  the LEFT JOIN match-rate against the eligible-books universe before trusting
+  its coverage.
+
+  Open question (2026-08-04, issue #18): re-verified the 2026-08-02 sales-join
+  fix (goods_id_original) with a corrected check — the original verification
+  used LEFT JOIN + IS NULL, which is unreliable in ClickHouse: join_use_nulls
+  is off by default, so an unmatched row gets the column's type default (0 /
+  '') instead of NULL, and IS NULL silently never fires. Re-checked with
+  LEFT ANTI JOIN instead, and the result contradicts the 2026-08-02 entry:
+  goods_id_original matches only 94.5% of current stock book_ids, while plain
+  goods_id matches 99.8% — better, not worse. Do not treat the sales-join fix
+  as settled. Still needs: pull the ~8k goods_id_original values that fail to
+  match and check whether it's a genuine id-space issue, delisted/edge-case
+  items, or something that changed in the source tables since 2026-08-02.
+
+  Follow-up work (2026-09-18 to 2026-09-28, tracker ml_team-816; issue_ref
+  stays 18, the original showcase issue): the same pattern was extended into a
+  second table, analytics.bdf_core_full, for the whole network (no city/brand
+  filter), with history from 2024-01-01 and no rubric filter, instead of the
+  Moscow-only rolling table. State on 2026-09-28:
+    - table analytics.bdf_core_full, grain day x shop x book, MergeTree,
+      PARTITION BY toYYYYMM(day), ORDER BY (day, shop_id, book_id). Columns:
+      qty_sold Int32 (signed so that a negative quantity, if one appears, does
+      not wrap around as UInt32 would; returns themselves are excluded by
+      operation_type = 0), stock_rem Int32, three UInt8 shop flags
+      (shop_open_180d, shop_transport_ok, shop_is_fair), upload_time DateTime
+      DEFAULT now(); book_id is UInt64 with CODEC(Delta, ZSTD);
+    - history load from a notebook (backfill_bdf_core_full.ipynb in the scratch
+      notebooks folder, outside the airflow repo): 143 weekly batches, each =
+      delete window, assert 0 rows, insert, count; JSON checkpoint of finished
+      batch start dates next to the notebook; progress via tqdm. The checkpoint
+      lists 143 of 143 batches as finished (last write 2026-09-27 23:43). It
+      does not record which query version each batch used, so the reloaded
+      table has not been verified yet (see open items). The loaded history ends
+      on 2026-09-26 (the last batch is 2026-09-21..26); 2026-09-27 onward is
+      covered only by the first window of the DAG. The final resumed run
+      loaded its 31 remaining batches in 1 h 50 min (mean 214 s, range 131-589
+      s);
+    - daily DAG bdf_core_full_daily (dags/dag_n_bdf_core_full_daily.py, with
+      bdf_core_full_sql.py and bdf_core_full_loader.py next to the old showcase
+      modules): the same schedule ('10 1 * * *') and the same rolling window
+      [today-7, today-1] as the old DAG, no downstream trigger yet. Merged to
+      master on 2026-09-27 (feature commit 9c0c33637, merge commit 71e347b35).
+      Not checked: whether the DAG is unpaused or has already run. Its first run
+      deletes and reloads [D-7, D-1], so step 6 (manual run, read the task log)
+      should be done with the DAG paused;
+    - the old table book_demand_showcase_core, its DAG and the three forecast
+      pipelines that read it were not touched.
+
+  Requests from the lead and what was done with them (2026-09-23 and
+  2026-09-27, tracker ml_team-816). Status per request, with reasons, for
+  review with the lead.
+    2026-09-23, implemented:
+    - operation_type = 0 was added to the sales filter (normal receipt, not a
+      return);
+    - sales lines that fulfil an online order of type order_type_cor = 1 are
+      excluded, lines without a barcode stay (details under Findings).
+    2026-09-27, request 1: remove the shop eligibility filters from the load.
+    - Done for three conditions ('open >= 180 days', 'transport not stopped',
+      'not a fair'). They no longer remove rows: they are computed per batch at
+      window_end and stored as flag columns, so the shop-level part of the old
+      selection can be reproduced with one predicate (WHERE shop_open_180d AND
+      shop_transport_ok AND NOT shop_is_fair) and shops the business may need
+      later stay in the table. The reloaded table has not been checked yet.
+    - channel_id = 1 is still applied as a hard filter; the decision is open.
+      Its removal was requested and was not applied because retail_shops_info
+      holds about 1.34k points: 944 with channel_id 1, 386 with 0 and 12 with
+      channels 3, 4 and 5 (10, 1 and 1 points). A sample of 30 of the 386
+      channel-0 points is mostly non-retail objects: warehouses, a
+      distribution centre, wholesale sections, a transport service, returns and
+      defect receiving points, a reading room and fair stands. Their share of
+      stock and sales was not measured, so it is not known how much demand
+      keeping them out removes. Two other pipelines in the repo comment
+      channel_id = 1 as offline retail; the shop loaders also fill a missing
+      channel with 0 (isnull(channel_id, 0) in rt_shops_info.py), so 0 may
+      partly mean 'not set'. If the lead wants these points, the safer form is
+      an explicit channel column with a documented filter, not silent
+      inclusion.
+    - date_closed is still applied as a hard filter; the decision is open. It
+      is evaluated at each batch's window_end, so it only drops points already
+      closed on that date (a point that closes mid-batch is dropped from the
+      whole batch, including days it still traded), and historical rows of
+      now-closed points stay, so it does not fully stop closed points from
+      accumulating. Its effect on size was not measured and is probably small.
+      It can become a fourth flag the same way as the other three.
+    2026-09-27, request 2: drop two source-side filters.
+    - The sale_time +/- 2 day bounds on cdm_retail_receipts are kept. They
+      should not change the result if operation_day is always within 2 days of
+      sale_time (not checked). They are kept because the table is partitioned
+      by toYYYYMM(sale_time) with a sort key that starts with purchase and
+      position ids (checked in system.tables), so removing the bounds would
+      probably lose partition pruning; pitfall (3) of the root playbook
+      describes the same effect. Removal was not benchmarked.
+    - available_for_sale = 1 in the catalog filter is unchanged; the decision
+      is pending. Removing it would admit delisted books for periods when they
+      were on sale, but recsys_catalog_pim appears to hold only the current
+      state, so today's flag is applied to 2024 rows either way. The lead's
+      answer is needed on whether delisted titles should be included.
+    2026-09-27, request 3: a self-filling timestamp.
+    - Done through upload_time DateTime DEFAULT now(); the INSERT lists its
+      columns explicitly so that the default applies. A new updated_at column
+      was requested; upload_time already exists and is rewritten on every
+      window reload, which is what updated_at would show, so no second column
+      was added. Renaming upload_time to updated_at is straightforward if the
+      lead wants that name. Whether anything already reads the table was not
+      checked.
+    Not started: a broader 'move or remove something else' refactoring. The
+    target is not defined yet (same table, or a looser second table), and
+    changing eligibility logic without a defined target risks silently changing
+    training data.
+    Not part of the requests and unchanged: the 30-day 'book is not new' rule
+    and the catalog category restriction (category_1_id = '18030') remain hard
+    filters.
+
+  Known limitations (2026-09-28, tracker ml_team-816):
+    - the 30-day 'book is not new' rule and the shop-age flag are evaluated
+      once per batch at window_end, not per day: in a weekly batch a book that
+      crosses 30 days mid-week is judged as of the last day, up to six days of
+      misclassification per batch; the daily DAG has the same granularity;
+    - widening the shop set (young, transport-stopped and fair points inside
+      channel 1) also widens the stock used to compute a book's first_seen, so
+      some books may now look older than in the previous table (not measured);
+    - retail_shops_info appears to keep only the current state
+      (ReplacingMergeTree, ~1.3k rows, read without FINAL), so eligibility must
+      be read from the stored flags later, not re-derived by joining today's
+      row with today(). Unmerged duplicate rows of a point would duplicate its
+      stock rows through the join (same pattern as in the old module; not
+      checked). If date_opened is NULL the flag is NULL; how that lands in the
+      UInt8 column was not checked;
+    - the table is stock-driven (a row exists only where wh_remainder_shops has
+      a row), so days with zero stock are absent, exactly as in the old table;
+    - recsys_catalog_pim appears to hold only the current state, so category
+      and availability of a 2024 row probably reflect today's catalog (to be
+      confirmed with the table owner);
+    - the notebook keeps its own copy of the SQL while the DAG uses
+      bdf_core_full_sql.py. On 2026-09-28 the two were identical after
+      whitespace normalisation; a query change has to be made in both places.
+      The DDL cell of the notebook is commented out after the reload, so
+      rerunning the notebook top to bottom does not recreate the table;
+    - the old showcase table still joins sales to stock on goods_id_original
+      (sales_daily in book_demand_showcase_core_sql.py on master), while its
+      stock side uses goods_id. If goods_id_original is the cash system's own
+      item id for Artix, as the table owner reports, Artix sales in it are lost
+      or attributed to wrong titles; the size of this effect on the old table
+      was not measured. A separate decision is needed because three forecast
+      pipelines read that table.
+
+  Findings worth reusing (2026-09, tracker ml_team-816):
+    - id spaces in cdm_retail_receipts. The source_id mapping (1 = SetRetail,
+      2 = UKM, 3 = Artix) comes from loader file names and comments in the repo.
+      The semantics of goods_id and goods_id_original are as reported by
+      chaudhari.m in a direct reply to the operator on 2026-09-23: goods_id is
+      the cleaned book id for all three systems; goods_id_original is the cash
+      system's own item id for Artix (not a book id) and, for SetRetail/UKM, a
+      book id with a possible +5000000 offset (the owner described these as
+      defect items; a column comment in the repo describes the offset as 'item
+      as in the source, +5000000 for BK' and goods_id as 'item without
+      offset'). Measured since 2024-01-01: 253.0M rows from source 1 and 7.56M
+      from source 3; for source 3, 4.09M rows (54%) have goods_id !=
+      goods_id_original and goods_id_original is never NULL. This is
+      consistent with the open question of 2026-08-04 above (goods_id_original
+      matched 94.5% of current stock ids, goods_id 99.8%) and supersedes the
+      2026-08-02 entry, which switched sales from goods_id to goods_id_original
+      and called it verified; that switch is still in the old table. The two
+      sets of figures are not reconciled (distinct stock ids versus row
+      counts, and the split between Artix ids and offset ids was not
+      measured). ncat_first_180d_period_sales.py uses goods_id only for
+      source_id = 3 and goods_id_original otherwise; sales in bdf_core_full use
+      goods_id for all sources;
+    - offline sales that fulfil an online order: static_view_lake_orders_on,
+      order_type_cor = if(site_id = 2 AND order_type IS NULL, 1, order_type),
+      joined on (goods_soft_check_number = barcode, book id = book_id_origin).
+      Per the operator, order_type_cor = 1 is a pure online order not served
+      from a shop shelf, while other types (2 = marketplace orders) still take
+      the book from a shelf and stay in the table; this reading of the codes
+      comes from the operator, not from a documented dictionary or the table
+      owner. First week only (2024-01-01..07): 443,471 qualifying sales lines,
+      6,852 with a barcode, 6,850 matched to an order line, of which 6,718 are
+      type 2 and 132 type 1; only the 132 are excluded. The distribution over
+      the full period is unknown, and other scripts in the repo group the
+      values 1, 5 and 6 together, so whether other codes should be excluded too
+      was not checked. The exclusion is written as (barcode IS NULL OR
+      (barcode, book) NOT IN (type-1 lines)) so lines without a barcode stay;
+      an inner-join formulation would drop them;
+    - operation_type = 0 means 'normal receipt, not a return' (comment in two
+      pipelines) and is added next to is_normal / goods_storno. The SQL files
+      that build cdm_retail_receipts (dags/scripts/cdm/set_retail_receipts/sql)
+      define is_normal as status != CANCELLED and goods_type = 0, while a
+      lakehouse job with a status-only variant writes a different table; this
+      was not traced to the exact file, so the explicit filter is kept;
+    - memory. With the whole network the per-batch query first died with Code
+      241 (48 GiB per-query limit) in DISTINCT over the (shop, book) pairs of
+      the 180-day lookback. Measured for the first batch: ~3.6B rows read, 635
+      shops, ~380k books, ~23.7M distinct pairs. Estimate, not measured: one
+      128-bit hash set of that size takes roughly 1 GiB, and if each of the 40
+      threads (max_threads = 40) held its own copy that would approach the 48
+      GiB limit. A second failure came from casting the big table's id to
+      String for comparison; casting the small lookup side to a number fixed
+      it. Two per-query settings (optimize_distinct_in_order,
+      optimize_aggregation_in_order) were tried once and did not help, probably
+      because the sort key of wh_remainder_shops is (ondate, pt_id), not the
+      DISTINCT key. After that the operator ruled out any settings changes on
+      the shared production server and the query was rewritten: every window
+      row with rem > 0 already proves that its (shop, book) pair had stock in
+      the lookback, so the pair set is redundant for such rows and shops and
+      books are filtered independently. Result: 2.46 GiB in use at second 149
+      of the first batch's ~178 s (a mid-run reading, not a recorded peak);
+      later batches averaged 3.6 minutes, so the full reload takes roughly
+      8.5-9 hours wall-clock. The expected behavioural difference of the
+      rewrite is rows with rem <= 0 on pairs that never had positive stock:
+      none were found in the first loaded week, and section 3 of the
+      comparison found 0 such rows among the 101M extra rows;
+    - storage (first full load, before the flag columns were added): 14.75B
+      rows took 27.27 GiB, 1.99 bytes/row (book_id 0.90, stock_rem 1.02, the
+      rest ~0.07). Delta+ZSTD cut book_id from 4.11 to ~0.86-0.90 bytes/row
+      (~4.5-4.8x). Narrower integer types were rejected: stock_rem reached 307
+      on the part of the table loaded at that time (does not fit UInt8), and
+      type width barely matters after compression (qty_sold is ~0 bytes even as
+      Int32); LowCardinality does not fit ~440k distinct books;
+    - comparison with the old table over its own range (Moscow, Chitai-Gorod
+      and Bukvoed brands only), on the earlier version of the new table (before
+      the flag columns; it ends on 2026-09-22, a day or more before the old
+      range ends, so growth is slightly understated). Run of 2026-09-24 over
+      2025-07-31..2026-09-23: old 554.3M rows / 84 shops / 114,925 books /
+      quantity 3.80M; new 629.0M / 80 / 146,934 / 4.18M, i.e. +13.5% rows,
+      +27.9% books, +10% quantity, 4 fewer shops. A later saved rerun over
+      2025-07-31..2026-09-26 shows old 558.4M / 84 / 115,156 / 3.83M against
+      the same new figures. Section 3 of that notebook (saved output): of
+      101.3M rows present in the new table but not in the old one, 75.6M
+      (74.6%) belong to books of the old rubric exclusion list, 0 have
+      stock_rem <= 0, and 25.7M (25.4%) are explained by neither cause.
+      Conversely about 30.7M old rows do not exist in the new table (about 5.5M
+      of them are days after 2026-09-22; the rest is probably the 4 missing
+      shops, unverified). Sections 7 (missing shops) and 8 (rubric breakdown)
+      have no saved output, so the fair filter as the reason for the 4 missing
+      shops is not verified; the switch of the sales key, the online-order
+      exclusion and the wider first_seen are further candidate causes that were
+      not measured. Every check must be rerun on the reloaded table, where fair
+      shops are included by design.
+
+  Operational pitfalls (2026-09, tracker ml_team-816):
+    - restarting the load loop without deleting the checkpoint silently skips
+      every batch already marked done; tqdm then shows an absurd speed and the
+      old logic stays in those weeks. This happened once: 85 weeks stayed on the
+      previous logic. After any change of the query or the schema: drop or
+      truncate the table, delete the checkpoint, rerun all batches;
+    - results shown in a live notebook are not on disk until it is saved, so
+      anyone reading the .ipynb file or a script sees stale outputs;
+    - UNION ALL of sum() over UInt32 and Int32 columns fails with 'no supertype
+      for Int64, UInt64': cast both sides with toInt64;
+    - NOT IN over a (Date, UInt64, UInt64) tuple against a 550M-row table needs
+      a 256-bit hash set and runs out of memory; compare cityHash64 of the tuple
+      instead (collision risk is negligible for a diagnostic);
+    - connection credentials are hard-coded in the scratch notebooks; keep them
+      out of repositories and playbooks and move them to a connection config
+      before a notebook is shared;
+    - likely contacts for the source tables (ownership inferred from git
+      history, not confirmed with them): chaudhari.m (receipts loaders and
+      DAGs of the order tables), turganov.a (scripts of the orders table),
+      eskerov.s (started the UKM loader), krukovskiy.ap
+      (ncat_first_180d_period_sales.py).
+
+  Open items (2026-09-28, tracker ml_team-816): verify the reloaded table (row
+  counts, per-week coverage, duplicate keys, flag columns) and rerun the
+  old-vs-new comparison and sections 3, 7 and 8 on it; run bdf_core_full_daily
+  once manually with the DAG paused, read the task log, then unpause (step 6);
+  get the lead's decisions on channel_id, date_closed, available_for_sale and
+  the name of the timestamp column; decide whether the old showcase table
+  should also switch to goods_id.

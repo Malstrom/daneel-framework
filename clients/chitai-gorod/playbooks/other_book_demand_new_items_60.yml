@@ -7,7 +7,7 @@ contact: null
 work_type: "other"
 created: "2026-09-07"
 issue_ref: null
-usage_count: 1
+usage_count: 2
 promoted_to_root: false
 
 context:
@@ -36,6 +36,7 @@ steps:
   - "When most individual allocations resolve to a single unit spread over dozens of candidate locations, the standard largest-remainder apportionment method silently breaks: at total=1 its 'largest remainder' is just the largest weight, so it deterministically picks the same top-weighted shop for every such case. On this data that sent 29% of all units to one shop. Replace it with a weighted lottery (floor(weight*total) guaranteed per location, weighted sampling without replacement for the leftover, seeded by the item's own id for reproducibility) - the aggregate outcome still matches the weight distribution, but individual allocations spread out. Confirm the fix with a concrete measurement (here: top-location share dropped from 29% to ~5%), not just by reasoning that it should work."
   - "A merge-based apportionment can silently cap out for the rare high-volume input if using weighted sampling without replacement alone (can't select more distinct locations than the location count). Fix by combining a deterministic floor(weight*total) base allocation with weighted-sampling-without-replacement only for the remainder - this also naturally subsumes the total=1 case and removes the need for a separate branch."
   - "Two independent copies of the same 'valid Moscow shop' filter (this pipeline's own, and the unrelated top_60 pipeline's) had drifted apart by two real bugs (see other_book_demand_forecast_matrix.yml for the fixes) - a filter this consequential, copy-pasted into a second pipeline for lack of a shared import convention in this codebase, needs the same fix applied to every copy, not just the one you happen to be looking at."
+  - "Both coefficients and the comparable-scale book selection read analytics.ncat_first_180d_period_sales (columns sale_first_180, qty_cumsum, day_passed) whose sales-measure semantics (offline only? net of returns? which anchor date? whole catalogue or a curated subset?) were never cross-checked against cdm_retail_receipts - taken on faith from the table and column names. This ncat_first_180d_* family already burned the project once: analytics.ncat_first_180d_catalog turned out to be new-releases-only, causing a silent backlist-exclusion bug (see book-demand-forecast-pipeline memory). Pending verification before reporting these coefficients as solid: for a sample of books compare sale_first_180 against an independently receipts-derived first-180-day offline-sales total (standard quality filters, anchored per book to its own first sale); if they diverge, rebuild coef_60_of_180 and the good_books cut purely from receipts. moscow_share's numerator and denominator DO come from cdm_retail_receipts with the standard filters - only the 60/180 ratio and the comparable-book selection lean on the unverified table."
 
 notes: >
   Table: analytics.book_demand_forecast_new_items_60. Schema: origin_date
@@ -48,6 +49,30 @@ notes: >
   0.22 (share of network sales landing in Moscow ЧГ/Буквоед shops). Both
   recomputed live every run from analytics.ncat_first_180d_period_sales and
   analytics.cdm_retail_receipts - not hardcoded constants, see step 3.
+
+  good_books (comparable-scale) selection, the SQL CTE that both
+  coefficient queries restrict to: per book take sale_first_180 and
+  qty_final = max(qty_cumsum); drop the top 1% by |qty_final -
+  sale_first_180| (99th-percentile outlier cut on late-life trajectory
+  divergence, OUTLIER_DIFF_QUANTILE = 0.99); keep sale_first_180 BETWEEN 5
+  AND 50 (COMPARABLE_SALE_FIRST_180_MIN / MAX). Then coef_60_of_180 =
+  sum(qty at day_passed<=60) / sum(sale_first_180) over that set, and
+  moscow_share = sum(Moscow ЧГ/БК receipts) / sum(all receipts) for the
+  same book_ids - both as a ratio of sums, not a mean of per-book ratios.
+  Those three constants (5, 50, 0.99) are the intended "adjust the
+  coefficients per assortment strategy" knob - widening the band shifts
+  them toward larger-book behaviour.
+
+  Lottery expected value: E[alloc_i] = floor(weight_i * total) +
+  P(shop i wins one leftover unit). For total = 1 (the ~72% case) that P
+  equals weight_i exactly, so E[alloc_i] = weight_i exactly; for total > 1
+  it is only approximately weight_i * total, because weighted
+  sampling-without-replacement inclusion probabilities are not exactly
+  proportional. The leftover draw caps at +1 per shop, but the floor base
+  is >= 1 whenever weight_i * total >= 1 - doesn't happen at the ~80-shop
+  Moscow scale (top shop ~5%), will happen at whole-network scale or for
+  high-total books, and that is correct (proportional-to-weight), not
+  concentration.
 
   Shop weight = a shop's share of total book sales over the trailing 180
   days (analytics.cdm_retail_receipts, same quality filters as top_60's

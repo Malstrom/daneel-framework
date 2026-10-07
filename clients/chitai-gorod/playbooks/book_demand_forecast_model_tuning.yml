@@ -11,7 +11,7 @@ contact: null
 work_type: "other"
 created: "2026-08-07"
 issue_ref: null
-usage_count: 6
+usage_count: 7
 promoted_to_root: false
 
 context:
@@ -124,6 +124,10 @@ steps:
   - "Verify published numbers by recomputing them from saved artifacts (forecast, actuals, feature frames) in a separate check notebook that prints OK/MISMATCH per check, rather than by re-reading the code that produced them - it catches both pipeline errors and write-up arithmetic slips, and is what makes numbers safe to put in front of a lead."
   - "Translate a threshold choice into the two quantities the business is actually arguing about (volume missed where forecast was zero, volume forecast where nothing sold) in units, per threshold, in one table - a debate framed as stockout risk versus shelf congestion needs an asymmetric answer from the business, not a symmetric accuracy metric from the analyst."
   - "Maintain a plain-language pipeline-explainer doc once the operator can no longer track changes from code alone - update it in the same turn as any material pipeline change, not as a separate cleanup pass."
+  - "The shipped tail forecast (build_forecast) has three constructions people routinely mis-state when describing or diagramming it: (1) tau_tier1 is re-calibrated every run by find_tau_for_recall (highest TAU_GRID value <= 0.5 that still hits TIER1_TARGET_RECALL = 0.8, else min(TAU_GRID)) - it is not a fixed number; (2) tier-2 forecast is exactly 1.0 or 0.0 via np.where(proba >= 0.5) - it never calls the regressor, tier 2 predicts presence of demand only, never a quantity; (3) tier-1 forecast is ceil(proba * qty) above tau, which deflates the raw regression qty for every proba < 1. Tiers are network sales ranks: tier 1 = 2001-8000 (TOP_EXCLUDE..TIER1_UNTIL); the true top-2000 never enters the tail population at all (handled by top_60). Dead pairs (no sale 300+ days) skip the classifier and regressor entirely and get 0."
+  - "The tail training/validation layout is 3 origins (N_ORIGINS=3, ORIGIN_STEP=60, FEATURE_WINDOW_DAYS=120, VAL_DAYS=60), NOT 3 train windows plus a separate 4th validation window. Stage 1 (probe): fit classifier + regressor on origins 1+2, hold out origin 3 for isotonic calibration + tau_tier1 selection + best-iteration + the recall/MAE/WAPE metrics logged to analytics.ml_monitoring. Stage 2 (final refit): retrain from scratch on all 3 origins combined, INCLUDING origin 3, with the stage-1 hyperparameters frozen. Origin 3 does double duty; no window is validation-only. A diagram that shows a fourth, later-in-time validation block is wrong."
+  - "Working agreement with the operator (stated 2026-09-10): before using any ClickHouse table this project has not already used, ASK the operator what it is - its grain, what its measure columns actually mean (offline vs online, gross vs net of returns, which anchor date), and whether it is the whole catalogue or a curated subset. Do not infer a table's semantics from its name or column names. This has cost the project twice in the ncat_first_180d_* family (ncat_first_180d_catalog was new-releases-only, silently excluding the backlist; ncat_first_180d_period_sales's sales measure is still unverified as of 2026-09-10)."
+  - "Working agreement with the operator (stated 2026-09-10): never start writing code straight away. First lay out, step by step and in detail, everything you intend to do - which files, which functions, which queries, what each step changes and why - and wait for explicit confirmation. This holds even when the request looks small or obvious. Several premature or out-of-order writes this engagement had to be reverted; explaining first is far cheaper than a revert."
 
 notes: >
   Current file map: production module /Users/nikita/Project/test/book_demand_forecast_60d.py
@@ -166,3 +170,16 @@ notes: >
   anchored to today()-relative filters, so its pair population isn't
   independent of when history was loaded; year-ago seasonal baseline not
   computable with full window coverage until val_start_day >= 2026-07-31.
+
+  Retrain-trigger design for the whole-network scale-up (daily retrain
+  becomes infeasible), discussed 2026-09-10, not built: PSI as a cheap
+  daily drift trigger. Agreed caveats - pair it with realized-error
+  tracking on newly-closed horizons (PSI catches input drift, misses
+  concept drift); compute output/score PSI plus the top few features
+  per segment, with bin edges fixed once from the training reference and
+  reused; calibrate the trip threshold from a historical backtest (what
+  PSI level actually preceded unacceptable metric degradation), not the
+  textbook 0.25; keep a hard max-age retrain floor regardless of PSI; and
+  treat the Moscow -> all-network cutover as a deliberate reference reset
+  (retrain once at cutover, then start PSI against the new reference), not
+  a drift alarm.

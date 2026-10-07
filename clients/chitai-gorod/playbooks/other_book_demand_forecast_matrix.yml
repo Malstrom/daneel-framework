@@ -7,7 +7,7 @@ contact: null
 work_type: "other"
 created: "2026-09-07"
 issue_ref: null
-usage_count: 1
+usage_count: 2
 promoted_to_root: false
 
 context:
@@ -41,6 +41,9 @@ steps:
   - "When one of several inputs to a combined output has already-correct source-of-truth data (here: top_60, after its two bugs were fixed) and the others don't, and fixing the others at the source is out of proportion to the task (tail's fix would touch the shared showcase query that also feeds model training, a materially bigger and riskier change than a shop-filter tweak), restrict the combined output to the correct input's key set at assembly time instead. This is a legitimate fix, not a workaround: it doesn't hide the other pipelines' bugs (they're still visible directly, by design, if anyone queries book_demand_forecast_tail_reco_60 on its own) but it stops them from reaching the delivered artifact."
   - "Before re-running a pipeline whose bug you just fixed, check whether it has a same-day idempotency guard (an already_done check that returns without recomputing if origin_date already has rows) - if it does, a same-day re-trigger after a fix silently no-ops rather than picking up the new code, and looks identical in the logs to a successful run. None of book_demand_forecast_top_reco_60, _tail_60, or _tail_reco_60 have this guard at all (top_60 and new_items_60 do) - the two without it don't silently skip on a same-day re-trigger, they silently double-write instead, appending a second copy of the day's rows on top of the stale ones, since none of these tables are ReplacingMergeTree. Check for the guard's presence (or absence) in the specific pipeline before re-triggering, not just assume one behavior for the whole DAG family - and either way, delete the day's existing rows before a same-day re-trigger meant to pick up a fix."
   - "A cross-team query joining an external system to one of these forecast tables on exact date equality (origin_date = toDate(upload_time)) will show a hard zero for 'today' as a structural artifact whenever the forecast table's own daily run lags real time by a day (normal for this whole pipeline family) - not because shops are actually missing. Recognize this shape (works for all past days, zero for the most recent) before investigating it as a data-coverage bug."
+  - "The idempotency-guard gap is not hypothetical - it fired in production. 2026-09-08: book_demand_forecast_top_reco_60 held two upload_time batches for one origin_date (a manual retrigger during a fix, plus the normal cascade run, both landing the same day); the second doubled every (shop_id, book_id) pair, and book_demand_forecast_matrix then failed its own cross-segment duplicate assertion. Every TriggerDagRunOperator in this chain uses reset_dag_run=True, so any re-trigger of an upstream DAG resets and re-cascades the whole downstream chain, and the three guardless pipelines (top_reco_60, tail_60, tail_reco_60) each append a second copy instead of skipping. Cleanup: ALTER TABLE ... DELETE WHERE origin_date = ... AND upload_time = '<stray batch ts>' (keep the newer batch), then re-run from the doubled table forward. A full-history count()-vs-uniqExact((shop_id,book_id)) scan found older doubles too (top 08-26/08-31, top_reco_60 08-31/09-02, tail 09-02, tail_reco_60 09-02/09-03) but every one lines up with that file's own creation or bugfix-commit date - dev-time retriggering, not steady-state recurrence."
+  - "'DAG ran green but wrote nothing' has three distinct silent paths in this family, all reporting success: (a) already_done skip on a same-day rerun (top_60, new_items_60 only); (b) empty-input early return (new_items_60: 'Новинок нет, писать нечего'); (c) origin_date is computed from source-data freshness, not today() - new_items_60 uses MAX(current_date) from sales_predictions_30d, top_60 uses MAX(toDate(operation_day)) from cdm_retail_receipts. If the automated chain runs before the external source refreshes that day, it computes yesterday's origin_date, finds it already written, and skips - green DAG, no new row, and the matrix's own per-segment get_latest_origin_date then re-serves yesterday's segment (visible as 'today's new segment has the exact same row count and sum as yesterday'). Confirmed 2026-09-09 for new_items_60; it self-recovered the next day once the source had refreshed before the run. Diagnose by comparing each segment's origin_date / count() / uniqExact(upload_time) over recent days against the source table's own max snapshot timestamp, and read the task log's 'Старт. origin_date=...' line."
+  - "run_id=manual__... does NOT mean a human clicked Trigger. Every DAG in this chain has schedule_interval=None, and Airflow labels every externally-triggered run - including one fired by an upstream TriggerDagRunOperator - as manual__. Don't infer human action from the prefix; check the run's actual trigger source and timing."
 
 notes: >
   Table: analytics.book_demand_forecast_matrix. Schema: origin_date Date,
@@ -75,15 +78,34 @@ notes: >
   matrix-assembly time instead per step 6. Shop 822 ("Свиблово", closed
   2026-08-16) is the other known tail-only issue, same workaround applies.
 
-  DAG chain as of 2026-09-07: book_demand_forecast_matrix has NO trigger
-  into it from anywhere in the existing chain (showcase_core_daily ->
-  top_60 -> [top_reco_60, tail_60, new_items_60] in parallel, tail_60 ->
-  tail_reco_60) - it only runs on manual trigger via the Airflow UI. Adding
-  an automatic trigger (from the end of the slowest branch, tail_reco_60,
-  or by making the whole chain sequential to remove the race where matrix
-  could read top_reco_60/new_items_60 before they've actually finished) is
-  a deliberately deferred decision, not an oversight - see chat history
-  2026-09-07 for the sequential-vs-parallel tradeoff discussion.
+  DAG chain as of 2026-09-09: fully sequential -
+  book_demand_showcase_core_daily -> top_60 -> top_reco_60 -> tail_60 ->
+  tail_reco_60 -> new_items_60 -> book_demand_forecast_matrix, and matrix
+  now has an automatic trigger into it for the first time (from
+  new_items_60; previously manual-only). Sequential over parallel was
+  chosen because the operator is moving the models to weekly retrain /
+  daily inference, so tail_60 stops being the ~80-min outlier that made
+  serializing everything behind it costly. This trigger rewiring was the
+  one piece KEPT when a larger 2026-09-08 change batch was reverted by the
+  operator as too much to review at once - the reverted, still-to-redo
+  parts: per-pipeline already_done guards for top_reco_60 / tail_60 /
+  tail_reco_60, a shared Moscow-shop-filter helper (to kill the
+  two-independent-copies problem), and a tail_60 final shop-restriction fix
+  (its own table still reports 83 shops, not 80 - STORE_ATTR_SQL's
+  `WHERE date_closed IS NULL` is only used in a how='left' merge that nulls
+  attribute columns but never removes a closed shop's pairs). See memory
+  note book-demand-dedup-guard-tail60-plan.
+
+  Matrix write-health check (run after any matrix DAG run): per
+  (origin_date, segment) - count() vs uniqExact((shop_id, book_id)) must be
+  equal (zero dup_rows), uniqExact(upload_time) must be 1, uniqExact(shop_id)
+  ~80, plus sum(forecast); then a GROUP BY shop_id, book_id HAVING n > 1
+  pair-dup query (must be empty) and a "shop_id NOT IN the top segment's
+  shop set" check (must be empty - confirms the restrict-to-top step ran).
+  2026-09-10 run was clean on all of these. Note: sum(forecast) for top and
+  tail has drifted down day-over-day (tail ~582k -> ~539k, top ~269k ->
+  ~262k over 09-07..09-10) - within normal model variation so far, but
+  relevant to the units-gap discussion in other_book_demand_reco_patch.yml.
 
   Verification: notebooks/production/book_demand_forecast_matrix_check.ipynb
   (self-contained, no pipeline imports) - rebuilds the same logic from
